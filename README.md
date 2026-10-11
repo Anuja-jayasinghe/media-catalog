@@ -17,6 +17,20 @@ TheTVDB and RAWG are possible supplemental sources if the primary candidates hav
 
 Planning and source evaluation. The first milestone is a reproducible evidence report and a go/no-go decision for TMDB and IGDB.
 
+## First probes
+
+Copy `.env.example` to `.env` and fill in the TMDB API read token and Twitch application credentials. `.env` is ignored by Git. Python 3.10+ is sufficient; the probe uses only the standard library.
+
+```sh
+python3 scripts/source_probe.py validate
+python3 scripts/source_probe.py search
+python3 scripts/source_probe.py soak --provider tmdb --duration 60 --rps 1
+python3 scripts/source_probe.py soak --provider igdb --duration 60 --rps 1
+python3 -m unittest discover -s tests
+```
+
+The nine-title fixture is an initial connectivity check, not the 180-title coverage study. Search results with no verified provider ID require manual review. The soak command is deliberately capped at two requests per second and one hour; the future application load test will use local fixtures rather than public API traffic.
+
 ## License
 
 The original code and documentation in this repository are MIT licensed. Third-party catalog data, artwork, and API responses retain their providers' terms and are not covered by this license.
