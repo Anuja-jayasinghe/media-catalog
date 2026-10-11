@@ -1,0 +1,11 @@
+[
+  {"media_type":"movie","query":"The Super Mario Bros. Movie","expected_title":"The Super Mario Bros. Movie","expected_year":2023,"expected_id":502356,"bucket":"recent"},
+  {"media_type":"movie","query":"Dune","expected_title":"Dune","expected_year":2021,"bucket":"ambiguous"},
+  {"media_type":"movie","query":"Parasite","expected_title":"Parasite","expected_year":2019,"bucket":"non_english"},
+  {"media_type":"tv","query":"Breaking Bad","expected_title":"Breaking Bad","expected_year":2008,"expected_id":1396,"bucket":"older"},
+  {"media_type":"tv","query":"The Office","expected_title":"The Office","expected_year":2005,"bucket":"ambiguous"},
+  {"media_type":"tv","query":"Dark","expected_title":"Dark","expected_year":2017,"bucket":"non_english"},
+  {"media_type":"game","query":"Hades","expected_title":"Hades","expected_year":2020,"bucket":"indie"},
+  {"media_type":"game","query":"Prey","expected_title":"Prey","expected_year":2017,"bucket":"ambiguous"},
+  {"media_type":"game","query":"The Legend of Zelda: Breath of the Wild","expected_title":"The Legend of Zelda: Breath of the Wild","expected_year":2017,"bucket":"older"}
+]
