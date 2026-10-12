@@ -34,6 +34,16 @@ The nine-title fixture is an initial connectivity check, not the 180-title cover
 
 See the [initial live API results](docs/live-api-results-2026-10-12.md) for the first search, browse, and bounded soak findings.
 
+## Local API explorer
+
+Run the web UI with the same Git-ignored `.env` file:
+
+```sh
+python3 scripts/web_ui.py
+```
+
+Open `http://127.0.0.1:8765` to search movies, TV series, or games. Each search shows parsed result cards plus the redacted provider request, complete JSON response, and normalized JSON fields. TMDB and IGDB credentials stay on the local Python server. The server listens only on `127.0.0.1`; use `--port` to choose another local port. Stop it with Ctrl+C.
+
 ## License
 
 The original code and documentation in this repository are MIT licensed. Third-party catalog data, artwork, and API responses retain their providers' terms and are not covered by this license.
