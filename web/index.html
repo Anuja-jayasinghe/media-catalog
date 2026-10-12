@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#10131c">
+    <meta name="description" content="Search TMDB and IGDB, inspect their JSON responses, and compare parsed media results.">
+    <title>Catalog Lab · Media Catalog</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="Media Catalog Lab home"><span class="brand-mark">M<span>.</span></span><span>MEDIA CATALOG <small>/ LAB</small></span></a>
+        <div class="local-badge"><span class="live-dot"></span> LOCAL API EXPLORER</div>
+      </header>
+
+      <main>
+        <section class="intro" aria-labelledby="page-title">
+          <div class="eyebrow"><span class="eyebrow-line"></span> SOURCE VALIDATION WORKSPACE</div>
+          <h1 id="page-title">Search the catalog.<br><em>Inspect the source.</em></h1>
+          <p>Look up a title, see how the provider answered, and compare it with the fields your catalog can use.</p>
+        </section>
+
+        <section class="search-panel" aria-label="Search media sources">
+          <div class="panel-topline"><span>01 / QUERY</span><span>TMDB + IGDB</span></div>
+          <div class="type-switch" role="group" aria-label="Media type">
+            <button class="type-button active" type="button" data-type="movie" aria-pressed="true">Movies</button>
+            <button class="type-button" type="button" data-type="tv" aria-pressed="false">TV series</button>
+            <button class="type-button" type="button" data-type="game" aria-pressed="false">Games</button>
+          </div>
+          <form id="search-form" class="search-form">
+            <label class="sr-only" for="search-input">Title to search</label>
+            <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"></circle><path d="m16 16 5 5"></path></svg>
+            <input id="search-input" name="q" type="search" maxlength="120" autocomplete="off" placeholder="Search a movie title…" required>
+            <button id="search-button" class="search-button" type="submit">Search <span aria-hidden="true">↗</span></button>
+          </form>
+          <div class="examples"><span>TRY</span><button type="button" data-example="Dune" data-type="movie">Dune</button><button type="button" data-example="Dark" data-type="tv">Dark</button><button type="button" data-example="Hades" data-type="game">Hades</button><button type="button" data-example="The Legend of Zelda: Breath of the Wild" data-type="game">Breath of the Wild</button></div>
+        </section>
+
+        <div id="status" class="status" role="status" aria-live="polite">Choose a source and search a title to begin.</div>
+
+        <section id="workspace" class="workspace is-empty" aria-label="Search results and API details">
+          <div class="results-column">
+            <div class="section-heading"><div><span class="section-index">02 / RESULTS</span><h2>Matches <span id="result-count" class="count">0</span></h2></div><span id="provider-chip" class="provider-chip">—</span></div>
+            <div id="results" class="results"><div class="empty-state"><span class="empty-symbol">⌕</span><h3>Your results appear here.</h3><p>Search to see the provider's matches with title, year, description, and artwork when available.</p></div></div>
+          </div>
+
+          <aside class="inspector" aria-labelledby="inspector-title">
+            <div class="inspector-header"><div><span class="section-index">03 / INSPECT</span><h2 id="inspector-title">API exchange</h2></div><span class="json-pill">JSON</span></div>
+            <div class="inspector-tabs" role="tablist" aria-label="JSON view">
+              <button type="button" class="inspector-tab active" role="tab" aria-selected="true" data-view="request">Request</button>
+              <button type="button" class="inspector-tab" role="tab" aria-selected="false" data-view="response">Raw response</button>
+              <button type="button" class="inspector-tab" role="tab" aria-selected="false" data-view="parsed">Parsed</button>
+            </div>
+            <div class="code-toolbar"><span id="code-caption">Request sent to provider</span><button id="copy-button" type="button" disabled>Copy JSON</button></div>
+            <pre id="json-output" class="json-output" tabindex="0">{
+  "hint": "Run a search to inspect the API exchange"
+}</pre>
+            <p class="inspector-note">Credentials are kept on the local server and redacted in this view.</p>
+          </aside>
+        </section>
+      </main>
+
+      <footer><span>MEDIA CATALOG / SOURCE LAB</span><span>Metadata via <a href="https://www.themoviedb.org/" target="_blank" rel="noopener noreferrer">TMDB</a> and <a href="https://www.igdb.com/" target="_blank" rel="noopener noreferrer">IGDB</a></span></footer>
+    </div>
+  </body>
+</html>
