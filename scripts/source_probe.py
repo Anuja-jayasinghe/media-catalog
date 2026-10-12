@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -137,6 +138,65 @@ def run_search(items: list[dict], delay: float) -> int:
     return 1 if errors else 0
 
 
+def run_browse(window_days: int) -> int:
+    """Check first-page browse and dated-release queries without storing responses."""
+    today = datetime.date.today()
+    end = today + datetime.timedelta(days=window_days)
+    tmdb_token = os.environ.get("TMDB_READ_TOKEN")
+    if not tmdb_token:
+        raise RuntimeError("TMDB_READ_TOKEN is required for movie/TV browse queries")
+    tmdb_headers = {"Authorization": f"Bearer {tmdb_token}", "Accept": "application/json"}
+    for media_type in ("movie", "tv"):
+        for mode in ("popular", "upcoming"):
+            params = {"page": 1, "sort_by": "popularity.desc"}
+            if mode == "upcoming":
+                date_field = "primary_release_date" if media_type == "movie" else "first_air_date"
+                params = {
+                    "page": 1,
+                    "sort_by": f"{date_field}.asc",
+                    f"{date_field}.gte": today.isoformat(),
+                    f"{date_field}.lte": end.isoformat(),
+                }
+            response = request_json(
+                f"https://api.themoviedb.org/3/discover/{media_type}?{urllib.parse.urlencode(params)}",
+                headers=tmdb_headers,
+            )
+            title_field = "title" if media_type == "movie" else "name"
+            result_date_field = "release_date" if media_type == "movie" else "first_air_date"
+            print(json.dumps({
+                "provider": "tmdb", "media_type": media_type, "mode": mode,
+                "results_on_first_page": len(response.get("results", [])),
+                "reported_pages": response.get("total_pages"),
+                "examples": [
+                    {"id": result["id"], "title": result.get(title_field), "date": result.get(result_date_field)}
+                    for result in response.get("results", [])[:3]
+                ],
+            }))
+
+    token = twitch_token()
+    start_ts = int(datetime.datetime.combine(today, datetime.time.min, tzinfo=datetime.timezone.utc).timestamp())
+    end_ts = int(datetime.datetime.combine(end, datetime.time.min, tzinfo=datetime.timezone.utc).timestamp())
+    body = (
+        "fields id,date,game.id,game.name,platform.name,release_region; "
+        f"where date >= {start_ts} & date < {end_ts}; sort date asc; limit 20;"
+    ).encode()
+    response = request_json(
+        "https://api.igdb.com/v4/release_dates",
+        headers={"Client-ID": os.environ["TWITCH_CLIENT_ID"], "Authorization": f"Bearer {token}", "Accept": "application/json"},
+        data=body,
+    )
+    print(json.dumps({
+        "provider": "igdb", "media_type": "game", "mode": "upcoming_release_dates",
+        "results_on_first_page": len(response),
+        "unique_games_on_first_page": len({item.get("game", {}).get("id") for item in response}),
+        "examples": [
+            {"id": item["id"], "date": item.get("date"), "game": item.get("game"), "platform": item.get("platform")}
+            for item in response[:3]
+        ],
+    }))
+    return 0
+
+
 def percentile(values: list[float], percentage: float) -> float | None:
     if not values:
         return None
@@ -177,12 +237,13 @@ def run_soak(items: list[dict], provider: str, duration: int, rps: float) -> int
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["validate", "search", "soak"])
+    parser.add_argument("command", choices=["validate", "search", "browse", "soak"])
     parser.add_argument("--fixture", type=Path, default=FIXTURE)
     parser.add_argument("--delay", type=float, default=0.5, help="seconds between search requests")
     parser.add_argument("--provider", choices=["tmdb", "igdb"], help="required for soak")
     parser.add_argument("--duration", type=int, default=60, help="soak seconds, max 3600")
     parser.add_argument("--rps", type=float, default=1.0, help="soak request rate, max 2")
+    parser.add_argument("--window-days", type=int, default=30, help="browse upcoming window in days, max 365")
     args = parser.parse_args()
     load_local_env()
     items = fixtures(args.fixture)
@@ -193,6 +254,10 @@ def main() -> int:
         if args.delay < 0.5:
             parser.error("--delay must be at least 0.5 seconds")
         return run_search(items, args.delay)
+    if args.command == "browse":
+        if not 1 <= args.window_days <= 365:
+            parser.error("--window-days must be 1..365")
+        return run_browse(args.window_days)
     if not args.provider or not 1 <= args.duration <= 3600 or not 0 < args.rps <= 2:
         parser.error("soak requires --provider, --duration 1..3600, and --rps >0..2")
     return run_soak(items, args.provider, args.duration, args.rps)
