@@ -12,10 +12,10 @@ from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
-from catalog import main, database
+from catalog import main, database, limits
 from catalog import auth
 from catalog.auth import require_clerk_user
-from catalog.database import Base, CatalogUser, LibraryEntry, MissingTitleReport, ReportSubscriber, Title, TitleAlias, TitleIdentity
+from catalog.database import Base, CatalogRefreshCursor, CatalogUser, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, Title, TitleAlias, TitleIdentity
 from catalog.providers import ProviderTitle
 from catalog import providers
 
@@ -110,6 +110,81 @@ def test_discover_pages_continue_until_source_runs_out(client, monkeypatch):
     assert calls == [1, 2]
 
 
+def test_shared_provider_budget_is_atomic_and_resets_next_second(tmp_path, monkeypatch):
+    test_engine = create_engine(f"sqlite:///{tmp_path / 'budget.sqlite3'}")
+    Base.metadata.create_all(test_engine)
+    monkeypatch.setattr(limits, "engine", test_engine)
+    monkeypatch.setattr(limits, "SessionLocal", sessionmaker(bind=test_engine))
+    limits.reserve_provider_call("igdb", second=100)
+    limits.reserve_provider_call("igdb", second=100)
+    with pytest.raises(limits.ProviderRateLimited):
+        limits.reserve_provider_call("igdb", second=100)
+    limits.reserve_provider_call("igdb", second=101)
+    with limits.SessionLocal() as session:
+        assert [(row.second, row.used) for row in session.scalars(
+            select(ProviderRateWindow).order_by(ProviderRateWindow.second)
+        )] == [(100, 2), (101, 1)]
+    test_engine.dispose()
+
+
+def test_refresh_rotates_lanes_and_updates_released_dates(client, monkeypatch):
+    http, sessions = client
+    monkeypatch.setenv("CATALOG_JOB_TOKEN", "test-job-token")
+    calls = []
+    release_date = date(2027, 1, 1)
+
+    async def fake_browse(section, media_type, today, page):
+        calls.append((section, media_type, page))
+        if page == 1:
+            provider = "igdb" if media_type == "game" else "tmdb"
+            return ([ProviderTitle(provider, media_type, "42", "Changing release", "", None, release_date)], [])
+        return ([], [])
+
+    monkeypatch.setattr(main, "browse_providers", fake_browse)
+    assert http.post("/api/internal/refresh").status_code == 401
+    headers = {"Authorization": "Bearer test-job-token"}
+    first = http.post("/api/internal/refresh", headers=headers)
+    assert first.status_code == 200
+    assert first.json()["media_type"] == "movie"
+    assert first.json()["pages"] == {"1": 1, "2": 0}
+    with sessions() as session:
+        movie = session.scalar(select(Title).where(Title.media_type == "movie"))
+        assert movie.release_date == release_date
+        assert session.get(SearchSnapshot, f"discover:recent:movie:1:{date.today().isoformat()}") is not None
+        assert session.get(CatalogRefreshCursor, "slot").next_page == 2
+
+    second = http.post("/api/internal/refresh", headers=headers)
+    assert second.status_code == 200
+    assert second.json()["media_type"] == "tv"
+    assert calls == [("recent", "movie", 1), ("recent", "movie", 2),
+                     ("recent", "tv", 1), ("recent", "tv", 2)]
+    for _ in range(4):
+        assert http.post("/api/internal/refresh", headers=headers).status_code == 200
+    release_date = date(2027, 2, 1)
+    seventh = http.post("/api/internal/refresh", headers=headers)
+    assert seventh.json()["media_type"] == "movie"
+    with sessions() as session:
+        movies = session.scalars(select(Title).where(Title.media_type == "movie")).all()
+        assert len(movies) == 1
+        assert movies[0].release_date == release_date
+
+
+def test_refresh_retries_lane_after_first_page_fails(client, monkeypatch):
+    http, sessions = client
+    monkeypatch.setenv("CATALOG_JOB_TOKEN", "test-job-token")
+
+    async def fake_browse(_section, _media_type, _today, page):
+        if page == 1:
+            raise providers.ProviderSearchError("source unavailable")
+        return ([], [])
+
+    monkeypatch.setattr(main, "browse_providers", fake_browse)
+    response = http.post("/api/internal/refresh", headers={"Authorization": "Bearer test-job-token"})
+    assert response.status_code == 503
+    with sessions() as session:
+        assert session.get(CatalogRefreshCursor, "slot").next_page == 1
+
+
 def test_title_media_returns_trailer_and_external_link(client, monkeypatch):
     http, sessions = client
     with sessions() as session:
@@ -131,6 +206,7 @@ def test_title_media_returns_trailer_and_external_link(client, monkeypatch):
 
 def test_tmdb_media_without_trailer_uses_imdb_destination(monkeypatch):
     monkeypatch.setenv("TMDB_READ_TOKEN", "test-token")
+    monkeypatch.setattr(providers, "reserve_provider_call", lambda _provider: None)
     original_client = httpx.AsyncClient
 
     def fake_client(*args, **kwargs):
@@ -367,6 +443,7 @@ def test_reconcile_notifies_once_after_public_title_exists(client, monkeypatch):
 
 def test_tvmaze_fallback_when_tmdb_has_no_close_series(monkeypatch):
     monkeypatch.setenv("TMDB_READ_TOKEN", "test-token")
+    monkeypatch.setattr(providers, "reserve_provider_call", lambda _provider: None)
     original_client = httpx.AsyncClient
     calls = []
 
@@ -393,6 +470,35 @@ def test_tvmaze_fallback_when_tmdb_has_no_close_series(monkeypatch):
     assert titles[0].external_ids == (("imdb", "tt1234567"),)
     assert titles[0].overview == "A small show."
     assert any("tvmaze.com" in url for url in calls)
+
+
+def test_release_browse_orders_by_date_not_popularity(monkeypatch):
+    monkeypatch.setenv("TMDB_READ_TOKEN", "test-token")
+    monkeypatch.setenv("TWITCH_CLIENT_ID", "test-client")
+    seen = []
+
+    async def fake_request(_client, provider, method, url, **kwargs):
+        seen.append((provider, kwargs))
+        return httpx.Response(200, request=httpx.Request(method, url),
+                              json=[] if provider == "igdb" else {"results": []})
+
+    async def fake_token(_client):
+        return "test-token"
+
+    monkeypatch.setattr(providers, "provider_request", fake_request)
+    monkeypatch.setattr(providers, "igdb_token", fake_token)
+    async def browse():
+        async with httpx.AsyncClient() as api:
+            await providers.browse_tmdb(api, "recent", "movie", date(2026, 10, 13))
+            await providers.browse_tmdb(api, "upcoming", "tv", date(2026, 10, 13))
+            await providers.browse_igdb(api, "recent", date(2026, 10, 13))
+            await providers.browse_igdb(api, "upcoming", date(2026, 10, 13))
+
+    asyncio.run(browse())
+    assert seen[0][1]["params"]["sort_by"] == "primary_release_date.desc"
+    assert seen[1][1]["params"]["sort_by"] == "first_air_date.asc"
+    assert b"sort first_release_date desc" in seen[2][1]["content"]
+    assert b"sort first_release_date asc" in seen[3][1]["content"]
 
 
 def test_existing_report_table_gets_additive_columns(tmp_path, monkeypatch):
