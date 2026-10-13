@@ -44,6 +44,7 @@ class CatalogUser(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
     clerk_user_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    display_name: Mapped[str | None] = mapped_column(String(80))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     entries: Mapped[list[LibraryEntry]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
@@ -132,6 +133,17 @@ class SeasonProgress(Base):
     season_number: Mapped[int] = mapped_column(Integer)
     through_episode: Mapped[int | None] = mapped_column(Integer)
     marked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ShareLink(Base):
+    __tablename__ = "share_links"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    user_id: Mapped[str] = mapped_column(ForeignKey("catalog_users.id", ondelete="CASCADE"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class SearchSnapshot(Base):
@@ -244,6 +256,9 @@ def init_database() -> None:
         for column, definition in additions.items():
             if column not in entry_columns:
                 connection.execute(text(f"ALTER TABLE library_entries ADD COLUMN {column} {definition}"))
+        user_columns = {column["name"] for column in inspect(connection).get_columns("catalog_users")}
+        if "display_name" not in user_columns:
+            connection.execute(text("ALTER TABLE catalog_users ADD COLUMN display_name VARCHAR(80)"))
     # Existing local records predate the identity and alias tables.
     from .identity import normalize_name
 
