@@ -44,6 +44,47 @@ class ProviderSearchError(Exception):
     pass
 
 
+async def tv_seasons(provider: str, provider_id: str) -> list[dict]:
+    """Return numbered seasons from the title's canonical TV source."""
+    async with httpx.AsyncClient(timeout=12) as client:
+        if provider == "tvmaze":
+            response = await provider_request(client, "tvmaze", "GET", f"https://api.tvmaze.com/shows/{provider_id}/seasons")
+            response.raise_for_status()
+            return [{"number": item["number"], "name": item.get("name") or f"Season {item['number']}",
+                     "episode_count": item.get("episodeOrder")} for item in response.json() if isinstance(item.get("number"), int)]
+        token = os.getenv("TMDB_READ_TOKEN")
+        if provider != "tmdb" or not token:
+            raise ProviderSearchError("TV season source is unavailable")
+        response = await provider_request(client, "tmdb", "GET", f"https://api.themoviedb.org/3/tv/{provider_id}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+        response.raise_for_status()
+        return [{"number": item["season_number"], "name": item.get("name") or f"Season {item['season_number']}",
+                 "episode_count": item.get("episode_count")} for item in response.json().get("seasons", [])
+                if isinstance(item.get("season_number"), int)]
+
+
+async def tv_episodes(provider: str, provider_id: str, season_number: int) -> list[dict]:
+    """Return episodes with stable numbering and provider air dates."""
+    async with httpx.AsyncClient(timeout=12) as client:
+        if provider == "tvmaze":
+            response = await provider_request(client, "tvmaze", "GET",
+                f"https://api.tvmaze.com/shows/{provider_id}/episodes", params={"specials": 1})
+            response.raise_for_status()
+            items = [item for item in response.json() if item.get("season") == season_number]
+            return [{"number": item["number"], "name": item.get("name") or f"Episode {item['number']}",
+                     "air_date": parse_date(item.get("airdate"))} for item in items if isinstance(item.get("number"), int)]
+        token = os.getenv("TMDB_READ_TOKEN")
+        if provider != "tmdb" or not token:
+            raise ProviderSearchError("TV episode source is unavailable")
+        response = await provider_request(client, "tmdb", "GET",
+            f"https://api.themoviedb.org/3/tv/{provider_id}/season/{season_number}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+        response.raise_for_status()
+        return [{"number": item["episode_number"], "name": item.get("name") or f"Episode {item['episode_number']}",
+                 "air_date": parse_date(item.get("air_date"))} for item in response.json().get("episodes", [])
+                if isinstance(item.get("episode_number"), int)]
+
+
 async def provider_request(client: httpx.AsyncClient, provider: str, method: str, url: str, **kwargs) -> httpx.Response:
     """Reserve a shared request slot before sending provider traffic."""
     for attempt in range(2):

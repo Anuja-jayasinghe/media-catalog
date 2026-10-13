@@ -122,6 +122,18 @@ class EntryRevision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class SeasonProgress(Base):
+    __tablename__ = "season_progress"
+    __table_args__ = (UniqueConstraint("user_id", "title_id", "season_number", name="uq_user_tv_season"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    user_id: Mapped[str] = mapped_column(ForeignKey("catalog_users.id", ondelete="CASCADE"), index=True)
+    title_id: Mapped[str] = mapped_column(ForeignKey("titles.id", ondelete="CASCADE"), index=True)
+    season_number: Mapped[int] = mapped_column(Integer)
+    through_episode: Mapped[int | None] = mapped_column(Integer)
+    marked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class SearchSnapshot(Base):
     __tablename__ = "search_snapshots"
 
