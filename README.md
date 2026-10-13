@@ -19,6 +19,8 @@ TheTVDB and RAWG are possible supplemental sources if the primary candidates hav
 
 The first product slice now includes a Next.js interface, unified search and release browsing backed by TMDB and IGDB, a shared title table, and Clerk-protected personal library endpoints. The frontend supports public discovery without Clerk configuration; saving requires a Clerk application. Full catalog indexing, personalized recommendations, seasons, imports, and reporting remain planned. Catalog coverage and new-release freshness are still unmeasured beyond the initial smoke tests.
 
+The current mobile and desktop [interface direction](docs/interface-design.md) is a design iteration for review.
+
 ## Run the product slice locally
 
 The existing root `.env` supplies TMDB and Twitch credentials to the Python API. To configure sign-in, copy `frontend/.env.example` to `frontend/.env.local` and `backend/.env.example` to `backend/.env`. Put your Clerk publishable and secret keys in the frontend file. Put the Clerk secret key, JWT public key, and allowed frontend origin in the backend file. Set the provider credentials in the backend file if they are not already in the root `.env`. Keep all secret keys out of Git.
