@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import csv
+import io
 from datetime import date, timedelta
 from types import SimpleNamespace
 
@@ -432,6 +434,31 @@ def test_account_deletion_erases_private_catalog_after_clerk_succeeds(client, mo
         assert session.scalars(select(CustomList)).all() == []
         assert session.scalars(select(ShareLink)).all() == []
         assert len(session.scalars(select(EntryRevision)).all()) == 1
+
+
+def test_native_backup_preserves_private_fields_and_csv_is_portable(client):
+    http, sessions = client
+    with sessions() as session:
+        title = Title(provider="tmdb", media_type="movie", provider_id="200", name="=FORMULA")
+        session.add(title)
+        session.commit()
+        title_id = title.id
+    alice = {"X-Test-User": "alice"}
+    assert http.put(f"/api/library/{title_id}", headers=alice, json={"status": "completed",
+        "rating_half_steps": 7, "review": "=HYPERLINK(\"bad\")", "favorite": True,
+        "lists": ["Worth keeping"]}).status_code == 200
+    backup = http.get("/api/export/backup", headers=alice)
+    assert backup.status_code == 200
+    assert backup.headers["cache-control"] == "no-store"
+    assert backup.json()["format"] == "media-catalog-backup"
+    assert backup.json()["entries"][0]["review"] == '=HYPERLINK("bad")'
+    assert backup.json()["entries"][0]["rating_half_steps"] == 7
+    assert backup.json()["lists"] == ["Worth keeping"]
+    assert http.get("/api/export/backup", headers={"X-Test-User": "bob"}).json()["entries"] == []
+    rows = list(csv.DictReader(io.StringIO(http.get("/api/export/csv", headers=alice).text)))
+    assert rows[0]["title"] == "'=FORMULA"
+    assert rows[0]["review"] == "'=HYPERLINK(\"bad\")"
+    assert rows[0]["rating_5"] == "3.5"
 
 
 def test_unknown_title_cannot_be_saved(client):
