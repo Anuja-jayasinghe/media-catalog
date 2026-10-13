@@ -38,7 +38,7 @@ Current status values are planned, in progress, completed, and dropped. The API 
 
 ## Configuration and deployment
 
-- The API runs on SQLite locally and supports PostgreSQL through `DATABASE_URL`. Initialize the schema with `python -m catalog.database` before starting a production deployment; runtime schema creation is disabled by default on PostgreSQL.
+- The API runs on SQLite locally and supports PostgreSQL through `DATABASE_URL`. Use Neon's pooled URL for API traffic and set `DATABASE_URL_UNPOOLED` to its direct URL for `python -m catalog.database`; schema setup uses the direct connection. Run that command before starting a production deployment. Runtime schema creation is disabled by default on PostgreSQL.
 - Deploy `frontend/` and `backend/` as separate Vercel projects initially. Set `NEXT_PUBLIC_API_BASE_URL` to the backend URL. Configure `FRONTEND_ORIGINS` and `CLERK_AUTHORIZED_PARTIES` to the actual frontend origin; do not use `*` for either.
 - The frontend works in search-only mode before Clerk keys are configured. Library endpoints return a configuration error until the backend has Clerk credentials.
 - Public search and browse endpoints have no distributed rate limiter yet. Provider quota protection and abuse controls are required before a public launch. Debounce and database snapshots only reduce ordinary repeated requests.

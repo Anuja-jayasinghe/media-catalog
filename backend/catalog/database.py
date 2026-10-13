@@ -22,7 +22,11 @@ def utc_now() -> datetime:
 
 
 DEFAULT_SQLITE = f"sqlite:///{BACKEND / 'catalog.sqlite3'}"
+# The module entrypoint runs schema setup. Neon recommends a direct connection
+# for that job, while regular API traffic should use the pooled DATABASE_URL.
 DATABASE_URL = os.getenv("DATABASE_URL", DEFAULT_SQLITE)
+if __name__ == "__main__":
+    DATABASE_URL = os.getenv("DATABASE_URL_UNPOOLED") or DATABASE_URL
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
