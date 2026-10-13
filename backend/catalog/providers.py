@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import os
 import re
 import time
@@ -11,6 +12,8 @@ from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from itertools import zip_longest
 
 import httpx
+
+from .identity import close_name, normalize_name
 
 
 @dataclass(frozen=True)
@@ -23,6 +26,8 @@ class ProviderTitle:
     poster_url: str | None
     release_date: date | None
     popularity: float = 0.0
+    aliases: tuple[str, ...] = ()
+    external_ids: tuple[tuple[str, str], ...] = ()
 
 
 def parse_date(value: str | None) -> date | None:
@@ -75,7 +80,22 @@ async def search_tmdb(client: httpx.AsyncClient, query: str, media_type: str) ->
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
     response.raise_for_status()
-    return normalize_tmdb(response.json().get("results", [])[:8], media_type)
+    payload = response.json()
+    items = payload.get("results", [])
+    # TMDB sorts by relevance/popularity. Check a few more pages only when page one
+    # has no close title, so an obscure exact match is not lost behind popular hits.
+    if not any(close_name(query, item.get("title" if media_type == "movie" else "name") or "") for item in items):
+        for page in range(2, min(int(payload.get("total_pages") or 1), 3) + 1):
+            more = await client.get(
+                f"https://api.themoviedb.org/3/search/{media_type}",
+                params={"query": query, "include_adult": "false", "page": page},
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+            more.raise_for_status()
+            items.extend(more.json().get("results", []))
+            if any(close_name(query, item.get("title" if media_type == "movie" else "name") or "") for item in items):
+                break
+    return normalize_tmdb(items[:40], media_type)
 
 
 def normalize_tmdb(items: list[dict], media_type: str) -> list[ProviderTitle]:
@@ -85,12 +105,14 @@ def normalize_tmdb(items: list[dict], media_type: str) -> list[ProviderTitle]:
         if not name or item.get("id") is None:
             continue
         poster = item.get("poster_path")
+        original = item.get("original_title" if media_type == "movie" else "original_name")
         results.append(ProviderTitle(
             provider="tmdb", media_type=media_type, provider_id=str(item["id"]),
             name=name, overview=item.get("overview") or "",
             poster_url=f"https://image.tmdb.org/t/p/w342{poster}" if poster else None,
             release_date=parse_date(item.get("release_date" if media_type == "movie" else "first_air_date")),
             popularity=float(item.get("popularity") or 0),
+            aliases=(original,) if original and normalize_name(original) != normalize_name(name) else (),
         ))
     return results
 
@@ -103,7 +125,7 @@ async def search_igdb(client: httpx.AsyncClient, query: str) -> list[ProviderTit
     escaped = query.replace("\\", "\\\\").replace('"', '\\"')
     body = (
         f'search "{escaped}"; '
-        'fields id,name,first_release_date,summary,cover.image_id,version_parent,total_rating_count; limit 12;'
+        'fields id,name,first_release_date,summary,cover.image_id,alternative_names.name,version_parent,total_rating_count; limit 30;'
     )
     response = await client.post(
         "https://api.igdb.com/v4/games",
@@ -118,7 +140,7 @@ async def search_igdb(client: httpx.AsyncClient, query: str) -> list[ProviderTit
         1 if (item.get("name") or "").casefold().startswith(normalized_query) else 2,
         -(item.get("total_rating_count") or 0),
     ))
-    return normalize_igdb(items[:8])
+    return normalize_igdb(items[:20])
 
 
 def normalize_igdb(items: list[dict]) -> list[ProviderTitle]:
@@ -129,12 +151,15 @@ def normalize_igdb(items: list[dict]) -> list[ProviderTitle]:
         timestamp = item.get("first_release_date")
         released = datetime.fromtimestamp(timestamp, timezone.utc).date() if timestamp else None
         cover = (item.get("cover") or {}).get("image_id")
+        aliases = tuple(alias["name"] for alias in item.get("alternative_names") or []
+                        if isinstance(alias, dict) and alias.get("name"))
         results.append(ProviderTitle(
             provider="igdb", media_type="game", provider_id=str(item["id"]),
             name=item["name"], overview=item.get("summary") or "",
             poster_url=f"https://images.igdb.com/igdb/image/upload/t_cover_big/{cover}.jpg" if cover else None,
             release_date=released,
             popularity=float(item.get("total_rating_count") or 0),
+            aliases=aliases,
         ))
     return results
 
@@ -218,6 +243,55 @@ async def browse_providers(section: str, media_type: str, today: date, page: int
     return titles[:18] if media_type == "all" else titles, warnings
 
 
+async def search_tvmaze(client: httpx.AsyncClient, query: str) -> list[ProviderTitle]:
+    response = await client.get(
+        "https://api.tvmaze.com/search/shows", params={"q": query},
+        headers={"User-Agent": "MediaCatalog/0.1 (open-source catalog)", "Accept": "application/json"},
+    )
+    response.raise_for_status()
+    results = []
+    for item in response.json()[:20]:
+        show = item.get("show") or {}
+        name = show.get("name") or ""
+        if not show.get("id") or not close_name(query, name):
+            continue
+        imdb = (show.get("externals") or {}).get("imdb")
+        external_ids = (("imdb", imdb),) if isinstance(imdb, str) and re.fullmatch(r"tt\d{7,10}", imdb) else ()
+        summary = html.unescape(re.sub(r"<[^>]+>", " ", show.get("summary") or ""))
+        results.append(ProviderTitle(
+            provider="tvmaze", media_type="tv", provider_id=str(show["id"]),
+            name=name, overview=" ".join(summary.split()),
+            poster_url=(show.get("image") or {}).get("medium"),
+            release_date=parse_date(show.get("premiered")),
+            popularity=float(item.get("score") or 0), external_ids=external_ids,
+        ))
+    return results
+
+
+async def search_rawg(client: httpx.AsyncClient, query: str) -> list[ProviderTitle]:
+    key = os.getenv("RAWG_API_KEY")
+    if not key:
+        return []
+    response = await client.get(
+        "https://api.rawg.io/api/games",
+        params={"key": key, "search": query, "search_precise": "true", "page_size": 20},
+        headers={"Accept": "application/json"},
+    )
+    response.raise_for_status()
+    results = []
+    for item in response.json().get("results", []):
+        name = item.get("name") or ""
+        if item.get("id") is None or not close_name(query, name):
+            continue
+        results.append(ProviderTitle(
+            provider="rawg", media_type="game", provider_id=str(item["id"]),
+            name=name, overview="", poster_url=item.get("background_image"),
+            release_date=parse_date(item.get("released")),
+            popularity=float(item.get("rating") or 0),
+        ))
+    return results
+
+
 async def title_media(provider: str, media_type: str, provider_id: str) -> dict[str, str | None]:
     """Fetch a trailer and a verified detail URL only when a title is opened."""
     async with httpx.AsyncClient(timeout=12.0) as client:
@@ -255,6 +329,22 @@ async def title_media(provider: str, media_type: str, provider_id: str) -> dict[
             url = item.get("url") or ""
             external = url if isinstance(url, str) and url.startswith("https://www.igdb.com/games/") else f"https://www.igdb.com/games/{provider_id}"
             return {"trailer_url": f"https://www.youtube-nocookie.com/embed/{video_id}" if video_id else None, "external_url": external, "external_label": "IGDB"}
+        if provider == "tvmaze":
+            response = await client.get(f"https://api.tvmaze.com/shows/{int(provider_id)}")
+            response.raise_for_status()
+            url = response.json().get("url") or ""
+            external = url if isinstance(url, str) and url.startswith("https://www.tvmaze.com/shows/") else f"https://www.tvmaze.com/shows/{provider_id}"
+            return {"trailer_url": None, "external_url": external, "external_label": "TVmaze"}
+        if provider == "rawg":
+            key = os.getenv("RAWG_API_KEY")
+            if not key:
+                raise ProviderSearchError("RAWG credentials are missing")
+            response = await client.get(f"https://api.rawg.io/api/games/{int(provider_id)}", params={"key": key})
+            response.raise_for_status()
+            slug = response.json().get("slug") or provider_id
+            if not re.fullmatch(r"[a-z0-9-]+", slug):
+                slug = provider_id
+            return {"trailer_url": None, "external_url": f"https://rawg.io/games/{slug}", "external_label": "RAWG"}
     raise ProviderSearchError("Unsupported title source")
 
 
@@ -280,9 +370,26 @@ async def search_providers(query: str, media_type: str) -> tuple[list[ProviderTi
             warnings.append(f"{name} search is temporarily unavailable")
         else:
             groups.append(response)
-    if not groups:
-        raise ProviderSearchError("All selected catalog sources are unavailable")
     titles = [item for group in groups for item in group]
+    # Supplemental sources are queried only when their primary category lacks a
+    # plausible match. They are separate records unless a verified ID links them.
+    if len(normalize_name(query)) >= 4:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            fallbacks = []
+            labels = []
+            if media_type in {"all", "tv"} and not any(item.media_type == "tv" and close_name(query, item.name) for item in titles):
+                fallbacks.append(search_tvmaze(client, query))
+                labels.append("TVmaze")
+            if media_type in {"all", "game"} and os.getenv("RAWG_API_KEY") and not any(item.media_type == "game" and close_name(query, item.name) for item in titles):
+                fallbacks.append(search_rawg(client, query))
+                labels.append("RAWG")
+            for label, response in zip(labels, await asyncio.gather(*fallbacks, return_exceptions=True)):
+                if isinstance(response, BaseException):
+                    warnings.append(f"{label} search is temporarily unavailable")
+                else:
+                    titles.extend(response)
+    if not groups and not titles:
+        raise ProviderSearchError("All selected catalog sources are unavailable")
     normalized_query = query.casefold()
     titles.sort(key=lambda item: (
         0 if item.name.casefold() == normalized_query else

@@ -11,13 +11,15 @@ This repository began with source validation. The [catalog source decision](docs
 | Media | Primary candidate | Documentation |
 | --- | --- | --- |
 | Movies and TV | TMDB | https://developer.themoviedb.org/docs/finding-data |
+| TV fallback | TVmaze | https://www.tvmaze.com/api |
 | Games | IGDB | https://api-docs.igdb.com/ |
+| Game fallback, optional | RAWG | https://rawg.io/apidocs |
 
-TheTVDB and RAWG are possible supplemental sources if the primary candidates have measurable gaps. Provider terms, attribution, caching rules, and rate limits must be reviewed before integration. Each deployed instance should supply its own credentials; API keys and secrets must never be committed to this repository or sent to a browser.
+TVmaze is queried only when TMDB has no close series match. RAWG is queried only when IGDB has no close game match and `RAWG_API_KEY` is configured. TheTVDB remains a possible later integration. Provider terms, attribution, caching rules, and rate limits must be reviewed before public deployment. Each deployed instance should supply its own credentials; API keys and secrets must never be committed to this repository or sent to a browser.
 
 ## Status
 
-The first product slice now includes a Next.js interface, separate movie, TV series, and game discovery pages, unified search with grouped results, a shared title table, and Clerk-protected personal library endpoints. Each discovery page loads additional provider results as the user scrolls. A title opens an available trailer; without one, movie and TV titles open IMDb when TMDB supplies an IMDb ID, otherwise TMDB. Games open IGDB when no video is available. The frontend supports public discovery without Clerk configuration; saving requires a Clerk application. Full catalog indexing, personalized recommendations, seasons, imports, and reporting remain planned. Catalog coverage and new-release freshness are still unmeasured beyond the initial smoke tests.
+The product slice includes a Next.js interface, separate movie, TV series, and game discovery pages, unified search with grouped results, a shared title table, and Clerk-protected personal library endpoints. Each discovery page loads additional provider results as the user scrolls. A title opens an available trailer; without one, it opens a verified provider or IMDb page. Search can use supplemental TVmaze or RAWG results when primary sources have no close match. Exact provider and external IDs identify titles; aliases help search but never merge two titles on name alone. Search includes a short missing-title form that checks sources first, offers choices when names are ambiguous, then queues a deduplicated report. The frontend supports public discovery without Clerk configuration; saving requires a Clerk application. Full catalog indexing, personalized recommendations, seasons, and imports remain planned. Catalog coverage and new-release freshness are still unmeasured beyond the initial smoke tests.
 
 The current mobile and desktop [interface direction](docs/interface-design.md) is a design iteration for review.
 
@@ -45,6 +47,14 @@ npm run dev
 Open `http://localhost:3000`. The home page shows recent and upcoming titles in separate media sections. Movies, TV series, and Games each have Popular, New releases, and Coming soon collections that load more titles while scrolling. Search begins after two characters and groups results by media type. Use the plus control on a poster to track a title; opening the poster shows a trailer when available or sends you to its source page. Sign in to save a tracking status and see it in **My library**. SQLite is the local default; the hosted deployment uses PostgreSQL through `DATABASE_URL`. See the [architecture note](docs/architecture.md) for the API and data model.
 
 The browse API accepts `section=popular|recent|upcoming`, `media_type=movie|tv|game`, and `page=1..500`; responses include `has_more`. `GET /api/titles/{title_id}/media` resolves a trailer and external title link on demand. Provider pagination limits still apply.
+
+## Missing-title operations
+
+`POST /api/missing-titles` accepts a title name, media type, and optional reporter email. The API checks local and provider results immediately. If multiple exact names exist, it returns choices for the visitor to select; only “None of these” forces a report. Duplicate reports and subscriber addresses are stored once. Email addresses are stored in the database and are never included in public GitHub issues.
+
+Configure `GITHUB_TOKEN` and `GITHUB_REPOSITORY` in the **backend** environment to create a public issue for each unresolved report. Configure `RESEND_API_KEY`, `REPORT_FROM_EMAIL`, `ADMIN_EMAIL`, and `PUBLIC_CATALOG_URL` to notify the administrator and email optional subscribers after a title is available through the public catalog endpoint. Configure `CATALOG_JOB_TOKEN` in the backend and set the same token plus `CATALOG_API_URL` as GitHub Actions secrets. The [reconciliation workflow](.github/workflows/reconcile-missing-titles.yml) runs hourly, after pushes to `main` (including merged PRs), and on manual dispatch. It retries unresolved reports and sends each subscriber one publication email. Without these settings, reports remain in the database for later processing; issue creation and email delivery are not active.
+
+Run `python -m catalog.database` when upgrading an existing database. It creates the new identity/report tables, adds missing report metadata columns, and backfills existing title identities and aliases. Production PostgreSQL keeps automatic runtime schema changes disabled.
 
 ## First probes
 

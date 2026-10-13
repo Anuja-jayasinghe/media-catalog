@@ -4,8 +4,8 @@ Status: implemented locally on 2026-10-13. This is a foundation for the full [pr
 
 ## Request path
 
-1. The Next.js page searches as the user types, after a 450 ms pause. With no query, it shows recent and upcoming releases. The optional filter narrows movies, TV series, or games.
-2. FastAPI calls TMDB and IGDB from the server, normalizes the results, and stores shared title records. A ten-minute database snapshot reuses repeated search results; release rows refresh after six hours and use date-based provider discovery. If all sources fail, an older same-day snapshot can still be shown.
+1. The Next.js page searches as the user types, after a 250 ms pause. With no query, it shows recent and upcoming releases. The optional filter narrows movies, TV series, or games.
+2. FastAPI calls TMDB and IGDB from the server, normalizes the results, and stores shared title records. TVmaze, and optionally RAWG, are queried when the corresponding primary source has no close match. A ten-minute database snapshot reuses repeated search results; release rows refresh after six hours and use date-based provider discovery. If all sources fail, an older snapshot or saved local matches can still be shown.
 3. Clerk signs users in on the frontend. The browser attaches a session token to library requests. FastAPI verifies the token with Clerk's Python SDK and allowed frontend origins before reading or changing private data.
 4. Each Clerk user maps to an internal catalog user ID. Each user has at most one library entry per shared title.
 
@@ -17,12 +17,19 @@ Status: implemented locally on 2026-10-13. This is a foundation for the full [pr
 | `catalog_users` | Internal user identity | Unique Clerk user ID; internal ID is used by personal data |
 | `library_entries` | Personal status and optional completion date | Unique user and title; never returned across users |
 | `search_snapshots` | Short-term search and release results | One snapshot per normalized query or dated browse section and media filter |
+| `title_identities` | Verified provider and external IDs | One media-specific external ID maps to one canonical title |
+| `title_aliases` | Searchable alternate names | Names aid retrieval but never establish identity |
+| `missing_title_reports` | Deduplicated unresolved requests | One report per normalized title name and media type |
+| `report_subscribers` | Optional private email contacts | One subscriber address per report |
 
-Current status values are planned, in progress, completed, and dropped. The API accepts exact, month-only, or unknown completion dates; the current interface exposes status changes first. TV episode progress, ratings, reviews, lists, import provenance, aliases, cross-provider reconciliation, release updates, and missing-title reports will extend this model in later slices.
+Current status values are planned, in progress, completed, and dropped. The API accepts exact, month-only, or unknown completion dates; the current interface exposes status changes first. TV episode progress, ratings, reviews, lists, import provenance, and release updates remain for later slices.
 
 ## API surface
 
 - `GET /api/search?q=...&media_type=all|movie|tv|game` — public normalized search.
+- `POST /api/missing-titles` — check sources, return a single match or ambiguous choices, or create a deduplicated report.
+- `POST /api/internal/reconcile` — bearer-token-protected report reconciliation and publication notifications.
+- `GET /api/titles/{title_id}` — public canonical title details.
 - `GET /api/discover?section=recent|upcoming&media_type=all|movie|tv|game` — public release browsing.
 - `GET /api/library` — current signed-in user's entries.
 - `PUT /api/library/{title_id}` — save or update one entry with a status and optional completion date.
