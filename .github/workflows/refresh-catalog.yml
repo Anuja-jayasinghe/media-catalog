@@ -1,0 +1,28 @@
+name: Refresh release catalog
+
+on:
+  schedule:
+    - cron: "37 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: catalog-release-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refresh one release lane
+        env:
+          CATALOG_API_URL: ${{ secrets.CATALOG_API_URL }}
+          CATALOG_JOB_TOKEN: ${{ secrets.CATALOG_JOB_TOKEN }}
+        run: |
+          if [ -z "$CATALOG_API_URL" ] || [ -z "$CATALOG_JOB_TOKEN" ]; then
+            echo "Catalog refresh is not configured; skipping."
+            exit 0
+          fi
+          curl --fail --show-error --silent --retry 2 --max-time 55 \
+            --request POST \
+            --header "Authorization: Bearer $CATALOG_JOB_TOKEN" \
+            "$CATALOG_API_URL/api/internal/refresh"
