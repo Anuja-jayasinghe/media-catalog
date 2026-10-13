@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 from catalog import main, database, limits
 from catalog import auth
 from catalog.auth import require_clerk_user
-from catalog.database import Base, CatalogRefreshCursor, CatalogUser, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, Title, TitleAlias, TitleIdentity
+from catalog.database import Base, CatalogRefreshCursor, CatalogUser, CustomList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, Title, TitleAlias, TitleIdentity
 from catalog.providers import ProviderTitle
 from catalog import providers
 
@@ -282,6 +282,57 @@ def test_completion_date_validation_and_removal(client):
     assert valid.json()["completed_on"] == "2026-10-01"
     assert http.delete(path).status_code == 204
     assert http.get("/api/library").json() == []
+
+
+def test_library_details_lists_and_revision_history_are_private(client):
+    http, sessions = client
+    with sessions() as session:
+        game = Title(provider="igdb", media_type="game", provider_id="77", name="Example game")
+        session.add(game)
+        session.commit()
+        title_id = game.id
+    path = f"/api/library/{title_id}"
+    alice = {"X-Test-User": "alice"}
+    bob = {"X-Test-User": "bob"}
+    saved = http.put(path, headers=alice, json={"status": "completed", "rating_half_steps": 9,
+        "review": "  Worth replaying  ", "favorite": True, "platforms": ["PC", "Switch"],
+        "lists": ["Favorites", "Co-op"]})
+    assert saved.status_code == 200
+    assert saved.json()["review"] == "Worth replaying"
+    assert saved.json()["lists"] == ["Co-op", "Favorites"]
+    assert http.get("/api/library", headers=bob).json() == []
+    assert http.get("/api/lists", headers=bob).json() == []
+    assert http.get("/api/lists", headers=alice).json()[0]["count"] == 1
+    # Status-only updates from existing clients must preserve optional details.
+    changed = http.put(path, headers=alice, json={"status": "dropped"})
+    assert changed.json()["rating_half_steps"] == 9
+    assert changed.json()["platforms"] == ["PC", "Switch"]
+    assert changed.json()["favorite"] is True
+    first_list = http.get("/api/lists", headers=alice).json()[0]
+    assert http.put(f"/api/lists/{first_list['id']}", headers=bob, json={"name": "Private"}).status_code == 404
+    assert http.put(f"/api/lists/{first_list['id']}", headers=alice, json={"name": "Together"}).status_code == 200
+    with sessions() as session:
+        revisions = session.scalars(select(EntryRevision).order_by(EntryRevision.created_at)).all()
+        assert len(revisions) == 3
+        assert json.loads(revisions[-1].after_json)["lists"] == ["Favorites", "Together"]
+    assert http.delete(path, headers=alice).status_code == 204
+    with sessions() as session:
+        assert len(session.scalars(select(EntryRevision)).all()) == 4
+        assert len(session.scalars(select(CustomList)).all()) == 2
+
+
+def test_library_details_reject_invalid_values(client):
+    http, sessions = client
+    with sessions() as session:
+        movie = Title(provider="tmdb", media_type="movie", provider_id="88", name="Example movie")
+        session.add(movie)
+        session.commit()
+        title_id = movie.id
+    path = f"/api/library/{title_id}"
+    for change in ({"rating_half_steps": 11}, {"lists": ["Same", "same"]},
+                   {"platforms": ["PC"]}, {"review": "a" * 10001}):
+        response = http.put(path, json={"status": "completed", **change})
+        assert response.status_code == 422
 
 
 def test_unknown_title_cannot_be_saved(client):
