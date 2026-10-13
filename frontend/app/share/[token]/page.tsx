@@ -1,6 +1,6 @@
 import type { Metadata } from "next";
 
-export const metadata: Metadata = { title: "Shared library · Media Catalog", robots: { index: false, follow: false } };
+export const metadata: Metadata = { title: "Shared library · MTGL", robots: { index: false, follow: false } };
 
 type SharedTitle = { id: string; name: string; media_type: "movie" | "tv" | "game"; poster_url: string | null; release_date: string | null };
 type SharedEntry = { title: SharedTitle; status: string; rating_half_steps: number | null; lists: string[] };
@@ -16,7 +16,7 @@ export default async function SharedLibraryPage({ params }: { params: Promise<{ 
   } catch { /* A missing API produces the same private unavailable state. */ }
   return <main className="shared-page content-wrap">
     <meta name="referrer" content="no-referrer" />
-    <a className="shared-home" href="/">M<span>.</span> MEDIACATALOG</a>
+    <a className="shared-home" href="/">MTGL</a>
     {library ? <><p className="eyebrow">A SHARED COLLECTION</p><h1>{library.display_name}&apos;s library</h1><p className="page-subtitle">A glimpse of the movies, series, and games they keep close.</p>
       {(["movie", "tv", "game"] as const).map((kind) => {
         const entries = library!.entries.filter((entry) => entry.title.media_type === kind);
