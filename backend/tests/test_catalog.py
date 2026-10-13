@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 from catalog import main, database, limits
 from catalog import auth
 from catalog.auth import require_clerk_user
-from catalog.database import Base, CatalogRefreshCursor, CatalogUser, CustomList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SeasonProgress, Title, TitleAlias, TitleIdentity
+from catalog.database import Base, CatalogRefreshCursor, CatalogUser, CustomList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SeasonProgress, ShareLink, Title, TitleAlias, TitleIdentity
 from catalog.providers import ProviderTitle
 from catalog import providers
 
@@ -373,6 +373,65 @@ def test_tv_progress_uses_dashboard_mark_time_and_keeps_future_episodes_unwatche
     with sessions() as session:
         assert session.scalars(select(SeasonProgress)).all() == []
         assert len(session.scalars(select(EntryRevision).where(EntryRevision.source == "season")).all()) == 3
+
+
+def test_share_links_expire_revoke_and_never_publish_private_reviews(client):
+    http, sessions = client
+    with sessions() as session:
+        title = Title(provider="tmdb", media_type="movie", provider_id="99", name="A private favorite")
+        session.add(title)
+        session.commit()
+        title_id = title.id
+    alice = {"X-Test-User": "alice"}
+    bob = {"X-Test-User": "bob"}
+    assert http.put(f"/api/library/{title_id}", headers=alice, json={"status": "completed", "rating_half_steps": 10,
+        "review": "Do not publish this", "lists": ["Watch together"]}).status_code == 200
+    assert http.put("/api/profile", headers=alice, json={"display_name": "Alice's movies"}).status_code == 200
+    assert http.post("/api/shares", headers=alice, json={"days": 15}).status_code == 422
+    created = http.post("/api/shares", headers=alice, json={"days": 14})
+    assert created.status_code == 201
+    token = created.json()["token"]
+    assert len(token) >= 32
+    public = http.get(f"/api/public/shares/{token}")
+    assert public.status_code == 200
+    assert public.json()["display_name"] == "Alice's movies"
+    assert public.json()["entries"][0]["lists"] == ["Watch together"]
+    assert "review" not in json.dumps(public.json())
+    share_id = created.json()["id"]
+    assert http.delete(f"/api/shares/{share_id}", headers=bob).status_code == 404
+    assert http.delete(f"/api/shares/{share_id}", headers=alice).status_code == 204
+    assert http.get(f"/api/public/shares/{token}").status_code == 404
+    expired = http.post("/api/shares", headers=alice, json={"days": 1}).json()
+    with sessions() as session:
+        share = session.get(ShareLink, expired["id"])
+        share.expires_at = database.utc_now() - timedelta(seconds=1)
+        session.commit()
+    assert http.get(f"/api/public/shares/{expired['token']}").status_code == 404
+
+
+def test_account_deletion_erases_private_catalog_after_clerk_succeeds(client, monkeypatch):
+    http, sessions = client
+    with sessions() as session:
+        title = Title(provider="igdb", media_type="game", provider_id="100", name="A game")
+        session.add(title)
+        session.commit()
+        title_id = title.id
+    assert http.put(f"/api/library/{title_id}", headers={"X-Test-User": "alice"},
+        json={"status": "completed", "lists": ["Old games"]}).status_code == 200
+    assert http.post("/api/shares", headers={"X-Test-User": "alice"}, json={"days": 1}).status_code == 201
+    assert http.put(f"/api/library/{title_id}", headers={"X-Test-User": "bob"}, json={"status": "planned"}).status_code == 200
+    deleted = []
+    async def fake_delete(clerk_id):
+        deleted.append(clerk_id)
+    monkeypatch.setattr(main, "delete_clerk_user", fake_delete)
+    assert http.delete("/api/account", headers={"X-Test-User": "alice"}).status_code == 204
+    assert deleted == ["alice"]
+    with sessions() as session:
+        assert [user.clerk_user_id for user in session.scalars(select(CatalogUser)).all()] == ["bob"]
+        assert len(session.scalars(select(LibraryEntry)).all()) == 1
+        assert session.scalars(select(CustomList)).all() == []
+        assert session.scalars(select(ShareLink)).all() == []
+        assert len(session.scalars(select(EntryRevision)).all()) == 1
 
 
 def test_unknown_title_cannot_be_saved(client):
