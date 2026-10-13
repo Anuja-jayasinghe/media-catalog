@@ -4,12 +4,14 @@ The first staging deployment uses two Vercel projects in the `anuja-jayasinghes-
 
 | Service | Project | URL |
 | --- | --- | --- |
-| Web | `media-catalog-staging-web` | https://media-catalog-staging-web.vercel.app |
+| Web | `media-catalog-staging-web` | https://mtgl.anujajay.com (also https://media-catalog-staging-web.vercel.app) |
 | API | `media-catalog-staging-api` | https://media-catalog-staging-api.vercel.app |
 
 Both projects were linked and deployed from their respective `frontend/` and `backend/` directories with the Vercel CLI. The web project uses the Next.js preset; the API project uses the FastAPI preset. The API's `/health/ready` endpoint verifies its Neon connection. Staging uses Clerk development keys and is for testing only. Public sign-in needs a Clerk production instance before a public release.
 
-The API project has its pooled `DATABASE_URL`, Clerk secret, TMDB token, and Twitch credentials in Vercel environment variables. It sets `FRONTEND_ORIGINS` and `CLERK_AUTHORIZED_PARTIES` to the staging web URL, `AUTO_CREATE_SCHEMA=0`, and `PUBLIC_CATALOG_URL` to the staging web URL. The web project has its Clerk keys and `NEXT_PUBLIC_API_BASE_URL` pointing to the staging API. Secret values are not stored in this repository.
+The API project has its pooled `DATABASE_URL`, Clerk secret, TMDB token, and Twitch credentials in Vercel environment variables. It sets `FRONTEND_ORIGINS` and `CLERK_AUTHORIZED_PARTIES` to both web origins, `AUTO_CREATE_SCHEMA=0`, and `PUBLIC_CATALOG_URL` to `https://mtgl.anujajay.com`. The web project has its Clerk keys and `NEXT_PUBLIC_API_BASE_URL` pointing to the staging API. Secret values are not stored in this repository.
+
+Cloudflare hosts DNS for `anujajay.com`. Its DNS-only `mtgl` CNAME points to the target Vercel supplied during domain verification. Vercel manages HTTPS for the subdomain; keep the CNAME target from Vercel's domain configuration if it ever changes. The custom domain currently serves the staging deployment, which still uses Clerk development keys.
 
 Run the schema setup from `backend/` with the direct Neon URL before deploying API changes that add tables or columns:
 
