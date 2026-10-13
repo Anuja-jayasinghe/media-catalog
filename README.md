@@ -52,7 +52,7 @@ The browse API accepts `section=popular|recent|upcoming`, `media_type=movie|tv|g
 
 ## Missing-title operations
 
-`POST /api/missing-titles` accepts a title name, media type, and optional reporter email. The API checks local and provider results immediately. If multiple exact names exist, it returns choices for the visitor to select; only “None of these” forces a report. Duplicate reports and subscriber addresses are stored once. Email addresses are stored in the database and are never included in public GitHub issues.
+`POST /api/missing-titles` accepts a title name, media type, and optional reporter email. The API checks the local catalog, refreshes current release pages for that media type, then searches providers before creating a report. If multiple exact names exist, it returns choices for the visitor to select; only “None of these” forces a report. Duplicate reports and subscriber addresses are stored once. Email addresses are stored in the database and are never included in public GitHub issues.
 
 Configure `GITHUB_TOKEN` and `GITHUB_REPOSITORY` in the **backend** environment to create a public issue for each unresolved report. Configure `RESEND_API_KEY`, `REPORT_FROM_EMAIL`, `ADMIN_EMAIL`, and `PUBLIC_CATALOG_URL` to notify the administrator and email optional subscribers after a title is available through the public catalog endpoint. Configure `CATALOG_JOB_TOKEN` in the backend and set the same token plus `CATALOG_API_URL` as GitHub Actions secrets. The [reconciliation workflow](.github/workflows/reconcile-missing-titles.yml) runs hourly, after pushes to `main` (including merged PRs), and on manual dispatch. It retries unresolved reports and sends each subscriber one publication email. Without these settings, reports remain in the database for later processing; issue creation and email delivery are not active.
 
@@ -71,7 +71,7 @@ python3 scripts/source_probe.py soak --provider igdb --duration 60 --rps 1
 python3 -m unittest discover -s tests
 ```
 
-The nine-title fixture is an initial connectivity check, not the 180-title coverage study. Search results with no verified provider ID require manual review. Run `python3 scripts/coverage_report.py --results /path/to/search-results.jsonl` to grade a saved search run. The [catalog freshness guide](docs/catalog-freshness.md) explains the hourly release refresh, shared provider request budget, and remaining coverage work. The soak command is deliberately capped at two requests per second and one hour; the future application load test will use local fixtures rather than public API traffic.
+The nine-title fixture is an initial connectivity check, not the 180-title coverage study. Search results with no verified provider ID require manual review. Run `python3 scripts/coverage_report.py --results /path/to/search-results.jsonl` to grade a saved search run. The [catalog freshness guide](docs/catalog-freshness.md) explains the two-week release refresh, report-triggered freshness check, shared provider request budget, and remaining coverage work. The soak command is deliberately capped at two requests per second and one hour; the future application load test will use local fixtures rather than public API traffic.
 
 See the [initial live API results](docs/live-api-results-2026-10-12.md) for the first search, browse, and bounded soak findings.
 
