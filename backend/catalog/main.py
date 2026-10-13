@@ -203,6 +203,19 @@ def entry_snapshot(entry: LibraryEntry) -> dict:
     }
 
 
+def set_entry_lists(session: Session, entry: LibraryEntry, lists: list[CustomList]) -> None:
+    desired = {item.id for item in lists}
+    for link in list(entry.list_links):
+        if link.list_id not in desired:
+            entry.list_links.remove(link)
+    session.flush()
+    present = {link.list_id for link in entry.list_links}
+    for item in lists:
+        if item.id not in present:
+            entry.list_links.append(EntryList(list_id=item.id))
+    session.flush()
+
+
 def record_revision(session: Session, user_id: str, title_id: str, before: dict | None, after: dict | None):
     if before != after:
         session.add(EntryRevision(user_id=user_id, title_id=title_id, source="manual",
@@ -866,8 +879,7 @@ def save_to_library(title_id: str, change: TrackingUpdate, session: Db, clerk_us
                 session.flush()
                 existing[name.casefold()] = item
             resolved.append(item)
-        entry.list_links = [EntryList(list_id=item.id) for item in resolved]
-        session.flush()
+        set_entry_lists(session, entry, resolved)
     after = entry_snapshot(entry)
     if before != after:
         entry.updated_at = utc_now()

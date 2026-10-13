@@ -300,6 +300,7 @@ def test_library_details_lists_and_revision_history_are_private(client):
     assert saved.status_code == 200
     assert saved.json()["review"] == "Worth replaying"
     assert saved.json()["lists"] == ["Co-op", "Favorites"]
+    assert http.put(path, headers=alice, json={"status": "completed", "lists": ["Favorites", "Co-op"]}).status_code == 200
     assert http.get("/api/library", headers=bob).json() == []
     assert http.get("/api/lists", headers=bob).json() == []
     assert http.get("/api/lists", headers=alice).json()[0]["count"] == 1
