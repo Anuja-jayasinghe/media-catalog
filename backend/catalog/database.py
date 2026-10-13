@@ -57,6 +57,7 @@ class Title(Base):
     provider: Mapped[str] = mapped_column(String(16), index=True)
     media_type: Mapped[str] = mapped_column(String(8), index=True)
     provider_id: Mapped[str] = mapped_column(String(64))
+    verified: Mapped[bool] = mapped_column(Boolean, default=True)
     name: Mapped[str] = mapped_column(String(500), index=True)
     overview: Mapped[str] = mapped_column(Text, default="")
     poster_url: Mapped[str | None] = mapped_column(Text)
@@ -144,6 +145,31 @@ class ShareLink(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class ImportBatch(Base):
+    __tablename__ = "import_batches"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    user_id: Mapped[str] = mapped_column(ForeignKey("catalog_users.id", ondelete="CASCADE"), index=True)
+    source: Mapped[str] = mapped_column(String(32))
+    created_list_names_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    reverted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ImportChange(Base):
+    __tablename__ = "import_changes"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("import_batches.id", ondelete="CASCADE"), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    title_id: Mapped[str | None] = mapped_column(ForeignKey("titles.id", ondelete="CASCADE"))
+    object_kind: Mapped[str] = mapped_column(String(16))
+    season_number: Mapped[int | None] = mapped_column(Integer)
+    before_json: Mapped[str | None] = mapped_column(Text)
+    after_json: Mapped[str | None] = mapped_column(Text)
+    reverted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SearchSnapshot(Base):
@@ -259,6 +285,9 @@ def init_database() -> None:
         user_columns = {column["name"] for column in inspect(connection).get_columns("catalog_users")}
         if "display_name" not in user_columns:
             connection.execute(text("ALTER TABLE catalog_users ADD COLUMN display_name VARCHAR(80)"))
+        title_columns = {column["name"] for column in inspect(connection).get_columns("titles")}
+        if "verified" not in title_columns:
+            connection.execute(text("ALTER TABLE titles ADD COLUMN verified BOOLEAN DEFAULT TRUE"))
     # Existing local records predate the identity and alias tables.
     from .identity import normalize_name
 
