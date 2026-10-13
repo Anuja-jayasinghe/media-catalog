@@ -9,6 +9,9 @@ import asyncio
 import time
 import uuid
 import httpx
+import hashlib
+import secrets
+from urllib.parse import quote
 from hmac import compare_digest
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -22,7 +25,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .auth import require_clerk_user
-from .database import CatalogRefreshCursor, CatalogUser, CustomList, EntryList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SeasonProgress, SessionLocal, Title, TitleAlias, TitleIdentity, engine, init_database, utc_now
+from .database import CatalogRefreshCursor, CatalogUser, CustomList, EntryList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SeasonProgress, ShareLink, SessionLocal, Title, TitleAlias, TitleIdentity, engine, init_database, utc_now
 from .identity import normalize_name
 from .providers import ProviderSearchError, ProviderTitle, browse_providers, search_providers, title_media, tv_episodes, tv_seasons
 from .reports import create_github_issue, close_github_issue, send_admin_email, send_publication_email
@@ -193,6 +196,49 @@ class EpisodeOut(BaseModel):
     name: str
     air_date: date | None
     watched: bool
+
+
+class ProfileOut(BaseModel):
+    display_name: str
+
+
+class ProfileUpdate(BaseModel):
+    display_name: str = Field(min_length=2, max_length=80)
+
+    @field_validator("display_name")
+    @classmethod
+    def clean_display_name(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if len(value) < 2:
+            raise ValueError("A display name needs at least two characters")
+        return value
+
+
+class ShareCreate(BaseModel):
+    days: int = Field(ge=1, le=14)
+
+
+class ShareLinkOut(BaseModel):
+    id: str
+    expires_at: datetime
+    revoked_at: datetime | None
+
+
+class NewShareOut(ShareLinkOut):
+    token: str
+
+
+class SharedEntryOut(BaseModel):
+    title: TitleOut
+    status: str
+    rating_half_steps: int | None
+    lists: list[str]
+
+
+class PublicShareOut(BaseModel):
+    display_name: str
+    expires_at: datetime
+    entries: list[SharedEntryOut]
 
 
 def title_out(title: Title) -> TitleOut:
@@ -800,6 +846,112 @@ def find_user(session: Session, clerk_user_id: str, *, create: bool) -> CatalogU
     session.execute(insert(CatalogUser).values(**values).on_conflict_do_nothing(index_elements=["clerk_user_id"]))
     session.flush()
     return session.scalar(select(CatalogUser).where(CatalogUser.clerk_user_id == clerk_user_id))
+
+
+def public_display_name(user: CatalogUser) -> str:
+    return user.display_name or f"Collector {user.id[:6].upper()}"
+
+
+def as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+@app.get("/api/profile", response_model=ProfileOut)
+def get_profile(session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=True)
+    assert user is not None
+    return ProfileOut(display_name=public_display_name(user))
+
+
+@app.put("/api/profile", response_model=ProfileOut)
+def update_profile(change: ProfileUpdate, session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=True)
+    assert user is not None
+    user.display_name = change.display_name
+    session.commit()
+    return ProfileOut(display_name=user.display_name)
+
+
+@app.get("/api/shares", response_model=list[ShareLinkOut])
+def list_shares(session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=False)
+    if user is None:
+        return []
+    shares = session.scalars(select(ShareLink).where(ShareLink.user_id == user.id).order_by(ShareLink.created_at.desc())).all()
+    return [ShareLinkOut(id=item.id, expires_at=item.expires_at, revoked_at=item.revoked_at) for item in shares]
+
+
+@app.post("/api/shares", response_model=NewShareOut, status_code=201)
+def create_share(change: ShareCreate, session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=True)
+    assert user is not None
+    token = secrets.token_urlsafe(32)
+    share = ShareLink(user_id=user.id, token_hash=hashlib.sha256(token.encode()).hexdigest(),
+                      expires_at=utc_now() + timedelta(days=change.days))
+    session.add(share)
+    session.commit()
+    return NewShareOut(id=share.id, token=token, expires_at=share.expires_at, revoked_at=None)
+
+
+@app.delete("/api/shares/{share_id}", status_code=204)
+def revoke_share(share_id: str, session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=False)
+    share = session.get(ShareLink, share_id)
+    if user is None or share is None or share.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Share link not found")
+    if share.revoked_at is None:
+        share.revoked_at = utc_now()
+        session.commit()
+
+
+@app.get("/api/public/shares/{token}", response_model=PublicShareOut)
+def get_public_share(token: str, session: Db):
+    if len(token) > 128:
+        raise HTTPException(status_code=404, detail="Share link unavailable")
+    share = session.scalar(select(ShareLink).where(ShareLink.token_hash == hashlib.sha256(token.encode()).hexdigest()))
+    if share is None or share.revoked_at is not None or as_utc(share.expires_at) <= utc_now():
+        raise HTTPException(status_code=404, detail="Share link unavailable")
+    user = session.get(CatalogUser, share.user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="Share link unavailable")
+    entries = session.scalars(select(LibraryEntry).where(LibraryEntry.user_id == user.id).order_by(LibraryEntry.updated_at.desc())).all()
+    return PublicShareOut(display_name=public_display_name(user), expires_at=share.expires_at,
+        entries=[SharedEntryOut(title=title_out(entry.title), status=entry.status,
+            rating_half_steps=entry.rating_half_steps,
+            lists=sorted((link.custom_list.name for link in entry.list_links), key=str.casefold)) for entry in entries])
+
+
+async def delete_clerk_user(clerk_user_id: str) -> None:
+    secret = os.getenv("CLERK_SECRET_KEY")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Account deletion is not configured")
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            response = await client.delete(f"https://api.clerk.com/v1/users/{quote(clerk_user_id, safe='')}",
+                headers={"Authorization": f"Bearer {secret}", "Accept": "application/json"})
+        if response.status_code not in (200, 204, 404):
+            raise HTTPException(status_code=502, detail="Could not delete the sign-in account")
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail="Could not delete the sign-in account") from error
+
+
+@app.delete("/api/account", status_code=204)
+async def delete_account(session: Db, clerk_user_id: ClerkUser):
+    # Do not erase local data if Clerk rejects the account deletion.
+    await delete_clerk_user(clerk_user_id)
+    user = find_user(session, clerk_user_id, create=False)
+    if user is None:
+        return
+    entry_ids = list(session.scalars(select(LibraryEntry.id).where(LibraryEntry.user_id == user.id)))
+    list_ids = list(session.scalars(select(CustomList.id).where(CustomList.user_id == user.id)))
+    if entry_ids:
+        session.execute(delete(EntryList).where(EntryList.entry_id.in_(entry_ids)))
+    if list_ids:
+        session.execute(delete(EntryList).where(EntryList.list_id.in_(list_ids)))
+    for model in (ShareLink, SeasonProgress, EntryRevision, LibraryEntry, CustomList):
+        session.execute(delete(model).where(model.user_id == user.id))
+    session.delete(user)
+    session.commit()
 
 
 def require_tv_title(session: Session, title_id: str) -> Title:
