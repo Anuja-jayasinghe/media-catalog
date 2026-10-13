@@ -12,7 +12,7 @@ BUCKETS = ("recent", "older", "non_english", "indie", "upcoming", "ambiguous")
 MEDIA = ("movie", "tv", "game")
 
 
-def read_results(path: Path) -> dict[tuple[str, str], dict]:
+def read_results(path: Path) -> dict[tuple[str, str, int | None], dict]:
     results = {}
     for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
@@ -20,17 +20,17 @@ def read_results(path: Path) -> dict[tuple[str, str], dict]:
         row = json.loads(line)
         if "summary" in row:
             continue
-        key = (row.get("media_type"), row.get("query"))
+        key = (row.get("media_type"), row.get("query"), row.get("expected_id"))
         if key in results:
             raise ValueError(f"duplicate result at line {line_number}: {key}")
         results[key] = row
     return results
 
 
-def summarize(fixtures: list[dict], results: dict[tuple[str, str], dict]) -> dict:
-    keys = [(item["media_type"], item["query"]) for item in fixtures]
+def summarize(fixtures: list[dict], results: dict[tuple[str, str, int | None], dict]) -> dict:
+    keys = [(item["media_type"], item["query"], item.get("expected_id")) for item in fixtures]
     if len(set(keys)) != len(keys):
-        raise ValueError("fixture has duplicate media_type/query pairs")
+        raise ValueError("fixture has duplicate media_type/query/expected_id records")
     groups = defaultdict(list)
     missing = []
     ungraded = []
@@ -39,7 +39,7 @@ def summarize(fixtures: list[dict], results: dict[tuple[str, str], dict]) -> dic
         bucket = item.get("bucket")
         if bucket not in BUCKETS:
             raise ValueError(f"{media_type}/{item['query']}: invalid bucket")
-        row = results.get((media_type, item["query"]))
+        row = results.get((media_type, item["query"], item.get("expected_id")))
         if row is None:
             missing.append(f"{media_type}:{item['query']}")
             continue
@@ -61,7 +61,7 @@ def summarize(fixtures: list[dict], results: dict[tuple[str, str], dict]) -> dic
 
     counts = Counter((item["media_type"], item["bucket"]) for item in fixtures)
     complete_fixture = len(fixtures) == 180 and all(counts[(media, bucket)] == 10 for media in MEDIA for bucket in BUCKETS)
-    errors = [f"{key[0]}:{key[1]}" for key, row in results.items() if row.get("error")]
+    errors = [f"{key[0]}:{key[1]}:{key[2]}" for key, row in results.items() if row.get("error")]
     overall = score(groups[("overall", "all")])
     by_media = {media: score(groups[("media", media)]) for media in MEDIA}
     by_bucket = {bucket: score(groups[("bucket", bucket)]) for bucket in BUCKETS}
