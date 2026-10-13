@@ -1,21 +1,21 @@
 # Interface direction
 
-Status: implemented as a design iteration on 2026-10-13; open for user review.
+Status: revised design iteration on 2026-10-13; open for user review.
 
-The interface treats the catalog as a personal archive rather than a marketing page. Discovery, search, and the private library each have one clear purpose. Posters carry visual interest; descriptions and tracking choices appear in a focused title sheet when someone asks for them.
+The catalog uses a cinematic, content-first interface. Movies, TV series, and games stay in separate sections and dedicated discovery pages. Search keeps one input but presents each media type in its own result group. The private library uses the same grouping.
 
 ## Responsive structure
 
-- **Phone and tablet:** compact header, three-item bottom navigation, two-column search results, swipeable release rows with visible arrow controls, and a title sheet anchored to the bottom edge. Fixed navigation respects safe-area insets.
-- **Desktop:** persistent left navigation, wider poster grid, compact release rows, and a centered title dialog. The search screen remains one unified search across movies, TV series, and games.
-- Browser Back moves between Discover, Search, and My library. The title dialog can be closed with its visible button, Escape, or the backdrop.
+- A transparent top header holds direct links to Home, Movies, TV series, Games, My library, and Search. There is no sidebar or fixed bottom navigation. On narrow screens, the links scroll horizontally without covering the content.
+- Home has a featured title and separate movie, series, and game collections. Each category page offers Popular, New releases, and Coming soon, then loads more results as the user scrolls. A visible Load more control remains available.
+- Posters are the main browse surface. The poster opens a trailer if one is available; otherwise the visitor goes to IMDb for a movie or TV series with a known IMDb ID, TMDB as a fallback, or IGDB for games. A separate plus control opens tracking without leaving the catalog.
+- Browser Back moves between pages. The title dialog can be closed with its visible button, Escape, or the backdrop.
 
 ## Visual and interaction rules
 
-- System typography, a restrained dark canvas with a warm accent, and a complete light appearance. The user's theme choice is saved locally.
-- One hierarchy of surfaces, borders, and muted text in each appearance. Poster images reserve their aspect ratio so results do not jump while loading.
-- Navigation and action targets are at least 44 CSS pixels tall. Press, hover, focus, loading, selected, empty, and error states are explicit.
-- Motion gives immediate feedback and spatial continuity. Reduced-motion, reduced-transparency, and increased-contrast preferences have CSS alternatives.
-- Descriptions and tracking controls stay out of the browsing grid. Saving remains unavailable in preview mode until Clerk is configured.
+- Dark surfaces, large title typography, restrained lime accents, and poster artwork create a cinematic feel without reproducing another service's branding.
+- Poster frames reserve their aspect ratio. Images below the viewport load lazily. Loading, empty, error, pressed, focus, and selected states are visible.
+- Touch controls use comfortable targets; keyboard focus remains visible. Motion is restrained and reduced-motion and reduced-transparency preferences have CSS alternatives.
+- Tracking controls stay in the title dialog. Saving remains unavailable in public preview until Clerk is configured.
 
-The design uses the apple-design principles of purpose, agency, direct feedback, and spatial consistency, together with ui-ux-pro-max guidance for responsive navigation, contrast, touch targets, and clear form states. This is an implementation direction, not a claim that the visual preference has been finally approved.
+This design applies the apple-design principles of direct feedback and spatial consistency and the ui-ux-pro-max guidance for hierarchy, responsive behavior, contrast, and touch targets. It remains a reviewable implementation, not a final visual approval.

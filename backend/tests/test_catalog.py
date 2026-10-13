@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import date
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
@@ -14,6 +16,7 @@ from catalog import auth
 from catalog.auth import require_clerk_user
 from catalog.database import Base, CatalogUser, LibraryEntry, Title
 from catalog.providers import ProviderTitle
+from catalog import providers
 
 
 @pytest.fixture
@@ -66,10 +69,10 @@ def test_discover_reuses_snapshot_and_adds_releases_to_shared_catalog(client, mo
     http, sessions = client
     calls = 0
 
-    async def fake_browse(section, media_type, today):
+    async def fake_browse(section, media_type, today, page):
         nonlocal calls
         calls += 1
-        assert (section, media_type) == ("upcoming", "all")
+        assert (section, media_type, page) == ("upcoming", "all", 1)
         return ([
             ProviderTitle("tmdb", "movie", "10", "Future Film", "", None, date(2027, 1, 1)),
             ProviderTitle("igdb", "game", "20", "Future Game", "", None, date(2027, 2, 1)),
@@ -84,6 +87,65 @@ def test_discover_reuses_snapshot_and_adds_releases_to_shared_catalog(client, mo
     assert {item["media_type"] for item in first.json()["results"]} == {"movie", "game"}
     with sessions() as session:
         assert len(session.scalars(select(Title)).all()) == 2
+
+
+def test_discover_pages_continue_until_source_runs_out(client, monkeypatch):
+    http, _ = client
+    calls = []
+
+    async def fake_browse(section, media_type, today, page):
+        calls.append(page)
+        count = 20 if page == 1 else 5
+        return ([ProviderTitle("tmdb", "movie", str((page - 1) * 20 + index), f"Film {page}-{index}", "", None, None) for index in range(count)], [])
+
+    monkeypatch.setattr(main, "browse_providers", fake_browse)
+    first = http.get("/api/discover", params={"section": "popular", "media_type": "movie", "page": 1})
+    second = http.get("/api/discover", params={"section": "popular", "media_type": "movie", "page": 2})
+    cached_second = http.get("/api/discover", params={"section": "popular", "media_type": "movie", "page": 2})
+    assert first.json()["has_more"] is True
+    assert second.json()["has_more"] is False
+    assert len(second.json()["results"]) == 5
+    assert cached_second.json()["cached"] is True
+    assert calls == [1, 2]
+
+
+def test_title_media_returns_trailer_and_external_link(client, monkeypatch):
+    http, sessions = client
+    with sessions() as session:
+        title = Title(provider="tmdb", media_type="movie", provider_id="42", name="A film")
+        session.add(title)
+        session.commit()
+        title_id = title.id
+
+    async def fake_media(provider, media_type, provider_id):
+        assert (provider, media_type, provider_id) == ("tmdb", "movie", "42")
+        return {"trailer_url": "https://www.youtube-nocookie.com/embed/ABCDEFGHIJK", "external_url": "https://www.imdb.com/title/tt1234567/", "external_label": "IMDb"}
+
+    monkeypatch.setattr(main, "title_media", fake_media)
+    response = http.get(f"/api/titles/{title_id}/media")
+    assert response.status_code == 200
+    assert response.json()["external_label"] == "IMDb"
+    assert http.get("/api/titles/missing/media").status_code == 404
+
+
+def test_tmdb_media_without_trailer_uses_imdb_destination(monkeypatch):
+    monkeypatch.setenv("TMDB_READ_TOKEN", "test-token")
+    original_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={
+            "videos": {"results": [{"site": "YouTube", "type": "Teaser", "key": "ABCDEFGHIJK"}]},
+            "external_ids": {"imdb_id": "tt12345678"},
+        }))
+        return original_client(transport=transport, *args, **kwargs)
+
+    monkeypatch.setattr(providers.httpx, "AsyncClient", fake_client)
+    media = asyncio.run(providers.title_media("tmdb", "movie", "42"))
+    assert media == {
+        "trailer_url": None,
+        "external_url": "https://www.imdb.com/title/tt12345678/",
+        "external_label": "IMDb",
+    }
 
 
 def test_library_is_private_and_one_entry_per_user(client):

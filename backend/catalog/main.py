@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from .auth import require_clerk_user
 from .database import CatalogUser, LibraryEntry, SearchSnapshot, SessionLocal, Title, engine, init_database, utc_now
-from .providers import ProviderSearchError, ProviderTitle, browse_providers, search_providers
+from .providers import ProviderSearchError, ProviderTitle, browse_providers, search_providers, title_media
 
 
 @asynccontextmanager
@@ -63,6 +63,13 @@ class SearchOut(BaseModel):
     results: list[TitleOut]
     warnings: list[str] = []
     cached: bool = False
+    has_more: bool = False
+
+
+class TitleMediaOut(BaseModel):
+    trailer_url: str | None
+    external_url: str
+    external_label: str
 
 
 class TrackingUpdate(BaseModel):
@@ -186,23 +193,26 @@ async def search(
 @app.get("/api/discover", response_model=SearchOut)
 async def discover(
     session: Db,
-    section: Literal["recent", "upcoming"],
+    section: Literal["popular", "recent", "upcoming"],
     media_type: Literal["all", "movie", "tv", "game"] = "all",
+    page: Annotated[int, Query(ge=1, le=500)] = 1,
 ):
     today = datetime.now(timezone.utc).date()
-    key = f"discover:{section}:{media_type}:{today.isoformat()}"
+    key = f"discover:{section}:{media_type}:{page}:{today.isoformat()}"
     snapshot = session.get(SearchSnapshot, key)
     fetched_at = snapshot.fetched_at if snapshot else None
     if fetched_at and fetched_at.tzinfo is None:
         fetched_at = fetched_at.replace(tzinfo=timezone.utc)
     if snapshot and fetched_at and datetime.now(timezone.utc) - fetched_at < timedelta(hours=6):
-        return SearchOut(results=[title_out(title) for title in snapshot_titles(session, snapshot)], cached=True)
+        cached_titles = snapshot_titles(session, snapshot)
+        return SearchOut(results=[title_out(title) for title in cached_titles], cached=True, has_more=len(cached_titles) >= 20)
 
     try:
-        found, warnings = await browse_providers(section, media_type, today)
+        found, warnings = await browse_providers(section, media_type, today, page)
     except ProviderSearchError as error:
         if snapshot:
-            return SearchOut(results=[title_out(title) for title in snapshot_titles(session, snapshot)], warnings=["Showing older releases while sources are unavailable"], cached=True)
+            cached_titles = snapshot_titles(session, snapshot)
+            return SearchOut(results=[title_out(title) for title in cached_titles], warnings=["Showing older releases while sources are unavailable"], cached=True, has_more=len(cached_titles) >= 20)
         raise HTTPException(status_code=502, detail=str(error)) from error
 
     titles = persist_titles(session, found)
@@ -216,7 +226,20 @@ async def discover(
             {field: values[field] for field in ("title_ids_json", "fetched_at", "result_count")},
         ))
     session.commit()
-    return SearchOut(results=[title_out(title) for title in titles], warnings=warnings)
+    return SearchOut(results=[title_out(title) for title in titles], warnings=warnings, has_more=len(titles) >= 20)
+
+
+@app.get("/api/titles/{title_id}/media", response_model=TitleMediaOut)
+async def get_title_media(title_id: str, session: Db):
+    title = session.get(Title, title_id)
+    if title is None:
+        raise HTTPException(status_code=404, detail="Title not found")
+    try:
+        return await title_media(title.provider, title.media_type, title.provider_id)
+    except (ProviderSearchError, ValueError) as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=502, detail="Title media is temporarily unavailable") from error
 
 
 def find_user(session: Session, clerk_user_id: str, *, create: bool) -> CatalogUser | None:
