@@ -2,7 +2,7 @@
 
 An open-source, personal catalog for movies, TV series, and video games. The intended product will let each user search and browse a shared title catalog, then track what they have watched or played.
 
-The confirmed product requirements and phased build plan are in [docs/product-requirements.md](docs/product-requirements.md). The first-release [architecture](docs/architecture.md), [authentication](docs/authentication-decision.md), [hosting](docs/hosting-decision.md), and [email](docs/email-decision.md) choices are documented separately. See [Neon setup](docs/neon-setup.md) to connect a database for your own instance.
+The confirmed product requirements and phased build plan are in [docs/product-requirements.md](docs/product-requirements.md). The first-release [architecture](docs/architecture.md), [authentication](docs/authentication-decision.md), [hosting](docs/hosting-decision.md), and [email](docs/email-decision.md) choices are documented separately. See [Neon setup](docs/neon-setup.md) and [Clerk setup](docs/clerk-setup.md) to connect your own services.
 
 This repository began with source validation. The [catalog source decision](docs/catalog-decision.md) records a conditional go for product implementation based on the initial API checks and the planned missing-title flow. The broader [source validation plan](docs/source-validation-plan.md) remains available for measuring coverage, freshness, and reliability.
 
@@ -25,7 +25,7 @@ The current mobile and desktop [interface direction](docs/interface-design.md) i
 
 ## Run the product slice locally
 
-The existing root `.env` supplies TMDB and Twitch credentials to the Python API. To configure sign-in, copy `frontend/.env.example` to `frontend/.env.local` and `backend/.env.example` to `backend/.env`. Put your Clerk publishable and secret keys in the frontend file. Put the Clerk secret key, JWT public key, and allowed frontend origin in the backend file. Set the provider credentials in the backend file if they are not already in the root `.env`. Keep all secret keys out of Git.
+The existing root `.env` supplies TMDB and Twitch credentials to the Python API. To configure sign-in, copy `frontend/.env.example` to `frontend/.env.local` and `backend/.env.example` to `backend/.env`. Put your Clerk publishable and secret keys in the frontend file. Put the Clerk secret key and allowed frontend origin in the backend file. `CLERK_JWT_KEY` is optional when the backend can fetch Clerk's public keys. Set the provider credentials in the backend file if they are not already in the root `.env`. Keep all secret keys out of Git.
 
 In one terminal:
 
