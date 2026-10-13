@@ -8,6 +8,7 @@ import re
 import asyncio
 import time
 import uuid
+import httpx
 from hmac import compare_digest
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -21,9 +22,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .auth import require_clerk_user
-from .database import CatalogRefreshCursor, CatalogUser, CustomList, EntryList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SessionLocal, Title, TitleAlias, TitleIdentity, engine, init_database, utc_now
+from .database import CatalogRefreshCursor, CatalogUser, CustomList, EntryList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SeasonProgress, SessionLocal, Title, TitleAlias, TitleIdentity, engine, init_database, utc_now
 from .identity import normalize_name
-from .providers import ProviderSearchError, ProviderTitle, browse_providers, search_providers, title_media
+from .providers import ProviderSearchError, ProviderTitle, browse_providers, search_providers, title_media, tv_episodes, tv_seasons
 from .reports import create_github_issue, close_github_issue, send_admin_email, send_publication_email
 
 
@@ -175,6 +176,25 @@ class RenameList(BaseModel):
         return value
 
 
+class SeasonMark(BaseModel):
+    through_episode: int | None = Field(default=None, ge=1)
+
+
+class SeasonOut(BaseModel):
+    number: int
+    name: str
+    episode_count: int | None
+    marked_at: datetime | None
+    through_episode: int | None
+
+
+class EpisodeOut(BaseModel):
+    number: int
+    name: str
+    air_date: date | None
+    watched: bool
+
+
 def title_out(title: Title) -> TitleOut:
     return TitleOut.model_validate({column.name: getattr(title, column.name) for column in Title.__table__.columns})
 
@@ -216,9 +236,9 @@ def set_entry_lists(session: Session, entry: LibraryEntry, lists: list[CustomLis
     session.flush()
 
 
-def record_revision(session: Session, user_id: str, title_id: str, before: dict | None, after: dict | None):
+def record_revision(session: Session, user_id: str, title_id: str, before: dict | None, after: dict | None, source: str = "manual"):
     if before != after:
-        session.add(EntryRevision(user_id=user_id, title_id=title_id, source="manual",
+        session.add(EntryRevision(user_id=user_id, title_id=title_id, source=source,
                                   before_json=json.dumps(before) if before else None,
                                   after_json=json.dumps(after) if after else None))
 
@@ -782,6 +802,111 @@ def find_user(session: Session, clerk_user_id: str, *, create: bool) -> CatalogU
     return session.scalar(select(CatalogUser).where(CatalogUser.clerk_user_id == clerk_user_id))
 
 
+def require_tv_title(session: Session, title_id: str) -> Title:
+    title = session.get(Title, title_id)
+    if title is None or title.media_type != "tv":
+        raise HTTPException(status_code=404, detail="TV series not found")
+    return title
+
+
+async def source_seasons(title: Title) -> list[dict]:
+    try:
+        return await tv_seasons(title.provider, title.provider_id)
+    except (ProviderSearchError, httpx.HTTPError) as error:
+        raise HTTPException(status_code=503, detail="Season information is temporarily unavailable") from error
+
+
+async def source_episodes(title: Title, number: int) -> list[dict]:
+    try:
+        return await tv_episodes(title.provider, title.provider_id, number)
+    except (ProviderSearchError, httpx.HTTPError) as error:
+        raise HTTPException(status_code=503, detail="Episode information is temporarily unavailable") from error
+
+
+def episode_watched(episode: dict, progress: SeasonProgress | None) -> bool:
+    if progress is None or episode["air_date"] is None:
+        return False
+    if progress.through_episode is not None and episode["number"] > progress.through_episode:
+        return False
+    return episode["air_date"] <= progress.marked_at.date()
+
+
+def season_snapshot(progress: SeasonProgress) -> dict:
+    return {"season_number": progress.season_number, "through_episode": progress.through_episode,
+            "marked_at": progress.marked_at.isoformat()}
+
+
+@app.get("/api/library/{title_id}/seasons", response_model=list[SeasonOut])
+async def list_tv_seasons(title_id: str, session: Db, clerk_user_id: ClerkUser):
+    title = require_tv_title(session, title_id)
+    user = find_user(session, clerk_user_id, create=False)
+    marks = {mark.season_number: mark for mark in session.scalars(select(SeasonProgress).where(
+        SeasonProgress.user_id == user.id, SeasonProgress.title_id == title_id)).all()} if user else {}
+    seasons = await source_seasons(title)
+    return [SeasonOut(number=item["number"], name=item["name"], episode_count=item["episode_count"],
+                      marked_at=marks[item["number"]].marked_at if item["number"] in marks else None,
+                      through_episode=marks[item["number"]].through_episode if item["number"] in marks else None)
+            for item in seasons]
+
+
+@app.get("/api/library/{title_id}/seasons/{number}", response_model=list[EpisodeOut])
+async def list_tv_episodes(title_id: str, number: int, session: Db, clerk_user_id: ClerkUser):
+    title = require_tv_title(session, title_id)
+    if number < 0:
+        raise HTTPException(status_code=422, detail="Invalid season number")
+    user = find_user(session, clerk_user_id, create=False)
+    progress = session.scalar(select(SeasonProgress).where(SeasonProgress.user_id == user.id,
+        SeasonProgress.title_id == title_id, SeasonProgress.season_number == number)) if user else None
+    episodes = await source_episodes(title, number)
+    return [EpisodeOut(**item, watched=episode_watched(item, progress)) for item in episodes]
+
+
+@app.put("/api/library/{title_id}/seasons/{number}", response_model=list[EpisodeOut])
+async def mark_tv_season(title_id: str, number: int, change: SeasonMark, session: Db, clerk_user_id: ClerkUser):
+    title = require_tv_title(session, title_id)
+    if number < 0:
+        raise HTTPException(status_code=422, detail="Invalid season number")
+    episodes = await source_episodes(title, number)
+    today = utc_now().date()
+    available = [episode for episode in episodes if episode["air_date"] and episode["air_date"] <= today]
+    if not available:
+        raise HTTPException(status_code=422, detail="This season has no aired episodes to mark")
+    if change.through_episode is not None and not any(episode["number"] == change.through_episode for episode in available):
+        raise HTTPException(status_code=422, detail="Choose an aired episode in this season")
+    user = find_user(session, clerk_user_id, create=True)
+    assert user is not None
+    progress = session.scalar(select(SeasonProgress).where(SeasonProgress.user_id == user.id,
+        SeasonProgress.title_id == title_id, SeasonProgress.season_number == number))
+    before = season_snapshot(progress) if progress else None
+    if progress is None:
+        progress = SeasonProgress(user_id=user.id, title_id=title_id, season_number=number)
+        session.add(progress)
+    progress.through_episode = change.through_episode
+    progress.marked_at = utc_now()
+    record_revision(session, user.id, title_id, before, season_snapshot(progress), source="season")
+    entry = session.scalar(select(LibraryEntry).where(LibraryEntry.user_id == user.id, LibraryEntry.title_id == title_id))
+    if entry is None:
+        entry = LibraryEntry(user_id=user.id, title_id=title_id, status="in_progress")
+        session.add(entry)
+        session.flush()
+        record_revision(session, user.id, title_id, None, entry_snapshot(entry))
+    session.commit()
+    return [EpisodeOut(**item, watched=episode_watched(item, progress)) for item in episodes]
+
+
+@app.delete("/api/library/{title_id}/seasons/{number}", status_code=204)
+def clear_tv_season(title_id: str, number: int, session: Db, clerk_user_id: ClerkUser):
+    require_tv_title(session, title_id)
+    user = find_user(session, clerk_user_id, create=False)
+    if user:
+        progress = session.scalar(select(SeasonProgress).where(SeasonProgress.user_id == user.id,
+            SeasonProgress.title_id == title_id, SeasonProgress.season_number == number))
+        if progress:
+            record_revision(session, user.id, title_id, season_snapshot(progress), None, source="season")
+            session.delete(progress)
+            session.commit()
+
+
 @app.get("/api/library", response_model=list[LibraryOut])
 def list_library(session: Db, clerk_user_id: ClerkUser):
     user = find_user(session, clerk_user_id, create=False)
@@ -897,6 +1022,8 @@ def remove_from_library(title_id: str, session: Db, clerk_user_id: ClerkUser):
     entry = session.scalar(select(LibraryEntry).where(LibraryEntry.user_id == user.id, LibraryEntry.title_id == title_id))
     if entry is not None:
         record_revision(session, user.id, title_id, entry_snapshot(entry), None)
+        session.execute(delete(SeasonProgress).where(SeasonProgress.user_id == user.id,
+            SeasonProgress.title_id == title_id))
         session.delete(entry)
         session.commit()
     return None
