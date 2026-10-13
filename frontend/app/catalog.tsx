@@ -140,6 +140,14 @@ function AccountSettings({ getToken, onDeleted }: { getToken: () => Promise<stri
     setShares((current) => current.map((item) => item.id === id ? { ...item, revoked_at: new Date().toISOString() } : item));
     setNewLink(""); setMessage("Link turned off.");
   } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not turn off link"); } finally { setBusy(false); } }
+  async function download(kind: "backup" | "csv") { setBusy(true); setError(""); try {
+    const response = await request(`/api/export/${kind}`);
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url; link.download = kind === "backup" ? "media-catalog-backup.json" : "media-catalog.csv";
+    document.body.append(link); link.click(); link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not download export"); } finally { setBusy(false); } }
   async function removeAccount() { setBusy(true); setError(""); try {
     await request("/api/account", { method: "DELETE" });
     if (onDeleted) await onDeleted();
@@ -149,6 +157,7 @@ function AccountSettings({ getToken, onDeleted }: { getToken: () => Promise<stri
   return <details className="account-settings"><summary>Sharing & account settings</summary><div className="settings-content">
     <section><h2>Public name</h2><p>This name appears when you share your library. Your email stays private.</p><form className="settings-row" onSubmit={rename}><label className="sr-only" htmlFor="display-name">Public name</label><input id="display-name" value={name} onChange={(event) => setName(event.target.value)} minLength={2} maxLength={80} required/><button disabled={busy || !name.trim()}>Save name</button></form></section>
     <section><h2>Share your library</h2><p>A link shows your titles, statuses, ratings, and lists. Your notes stay private. Anyone with the link can view it until it expires.</p><div className="settings-row"><label className="sr-only" htmlFor="share-days">Link duration</label><select id="share-days" value={days} onChange={(event) => setDays(Number(event.target.value))}>{[1, 3, 7, 14].map((value) => <option key={value} value={value}>{value} {value === 1 ? "day" : "days"}</option>)}</select><button disabled={busy} onClick={() => void create()}>Create link</button></div>{newLink && <div className="share-created"><label>New link<input readOnly value={newLink} onFocus={(event) => event.target.select()}/></label><button onClick={() => void navigator.clipboard.writeText(newLink)}>Copy</button></div>}{activeShares.length > 0 && <div className="share-list"><h3>Active links</h3>{activeShares.map((item) => <div key={item.id}><span>Expires {new Date(item.expires_at).toLocaleDateString()}</span><button disabled={busy} onClick={() => void revoke(item.id)}>Turn off</button></div>)}</div>}</section>
+    <section className="export-section"><h2>Export your library</h2><p>The native backup keeps every personal field and can be restored later. CSV is a portable table for other tools.</p><div className="export-actions"><button disabled={busy} onClick={() => void download("backup")}>Download full backup · JSON</button><button disabled={busy} onClick={() => void download("csv")}>Download table · CSV</button></div></section>
     <section className="danger-section"><h2>Delete account</h2><p>This permanently removes your catalog, lists, share links, and sign-in account. Export your data first if you want a copy.</p>{confirmDelete ? <div className="settings-row"><button className="danger-button" disabled={busy} onClick={() => void removeAccount()}>{busy ? "Deleting…" : "Permanently delete account"}</button><button onClick={() => setConfirmDelete(false)}>Cancel</button></div> : <button className="danger-outline" onClick={() => setConfirmDelete(true)}>Delete my account…</button>}</section>
     {message && <p role="status">{message}</p>}{error && <p className="form-error" role="alert">{error}</p>}
   </div></details>;
