@@ -27,7 +27,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .auth import require_clerk_user
-from .database import CatalogRefreshCursor, CatalogUser, CustomList, EntryList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SeasonProgress, ShareLink, SessionLocal, Title, TitleAlias, TitleIdentity, engine, init_database, utc_now
+from .database import CatalogRefreshCursor, CatalogUser, CustomList, EntryList, EntryRevision, ImportBatch, ImportChange, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SeasonProgress, ShareLink, SessionLocal, Title, TitleAlias, TitleIdentity, engine, init_database, utc_now
 from .identity import normalize_name
 from .providers import ProviderSearchError, ProviderTitle, browse_providers, search_providers, title_media, tv_episodes, tv_seasons
 from .reports import create_github_issue, close_github_issue, send_admin_email, send_publication_email
@@ -66,6 +66,7 @@ class TitleOut(BaseModel):
     media_type: str
     provider: str
     provider_id: str
+    verified: bool = True
     name: str
     overview: str
     poster_url: str | None
@@ -243,6 +244,37 @@ class PublicShareOut(BaseModel):
     entries: list[SharedEntryOut]
 
 
+class BackupEntryIn(TrackingUpdate):
+    title: TitleOut
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class BackupSeasonIn(BaseModel):
+    provider: Literal["tmdb", "tvmaze"]
+    provider_id: str
+    season_number: int = Field(ge=0)
+    through_episode: int | None = Field(default=None, ge=1)
+    marked_at: datetime
+
+
+class NativeBackupIn(BaseModel):
+    format: Literal["media-catalog-backup"]
+    version: Literal[1]
+    profile: ProfileUpdate | None = None
+    lists: list[str] = Field(default_factory=list, max_length=50)
+    entries: list[BackupEntryIn] = Field(default_factory=list, max_length=5000)
+    season_progress: list[BackupSeasonIn] = Field(default_factory=list, max_length=5000)
+
+    @field_validator("lists")
+    @classmethod
+    def valid_backup_lists(cls, values: list[str]) -> list[str]:
+        cleaned = [" ".join(value.split()) for value in values]
+        if any(not value or len(value) > 80 for value in cleaned) or len({value.casefold() for value in cleaned}) != len(cleaned):
+            raise ValueError("Backup lists must have unique names of at most 80 characters")
+        return cleaned
+
+
 def title_out(title: Title) -> TitleOut:
     return TitleOut.model_validate({column.name: getattr(title, column.name) for column in Title.__table__.columns})
 
@@ -336,7 +368,7 @@ def persist_titles(session: Session, found: list[ProviderTitle]) -> list[Title]:
             session.flush()
             previous_name = item.name
         else:
-            previous_name = title.name
+            previous_name = title.name if title.verified else item.name
             # A primary source can replace a supplemental display record while
             # preserving the canonical ID and every attached user entry.
             promote = item.provider in {"tmdb", "igdb"} and title.provider in {"tvmaze", "rawg"}
@@ -349,6 +381,7 @@ def persist_titles(session: Session, found: list[ProviderTitle]) -> list[Title]:
                 title.poster_url = item.poster_url or title.poster_url
                 title.release_date = item.release_date or title.release_date
                 title.updated_at = utc_now()
+            title.verified = True
         for namespace, external_id in ((item.provider, item.provider_id), *item.external_ids):
             linked = session.scalar(select(TitleIdentity).where(
                 TitleIdentity.namespace == namespace,
@@ -403,6 +436,7 @@ def local_search(session: Session, query: str, media_type: str) -> list[Title]:
         return []
     statement = select(Title).join(TitleAlias, TitleAlias.title_id == Title.id).where(
         TitleAlias.normalized.like(f"{key}%"),
+        Title.verified.is_(True),
     )
     if media_type != "all":
         statement = statement.where(Title.media_type == media_type)
@@ -417,7 +451,7 @@ def local_search(session: Session, query: str, media_type: str) -> list[Title]:
 
 def snapshot_titles(session: Session, snapshot: SearchSnapshot) -> list[Title]:
     ids = json.loads(snapshot.title_ids_json)
-    by_id = {item.id: item for item in session.scalars(select(Title).where(Title.id.in_(ids))).all()} if ids else {}
+    by_id = {item.id: item for item in session.scalars(select(Title).where(Title.id.in_(ids), Title.verified.is_(True))).all()} if ids else {}
     return [by_id[item_id] for item_id in ids if item_id in by_id]
 
 
@@ -524,7 +558,7 @@ async def discover(
 @app.get("/api/titles/{title_id}/media", response_model=TitleMediaOut)
 async def get_title_media(title_id: str, session: Db):
     title = session.get(Title, title_id)
-    if title is None:
+    if title is None or not title.verified:
         raise HTTPException(status_code=404, detail="Title not found")
     try:
         media = await title_media(title.provider, title.media_type, title.provider_id)
@@ -549,7 +583,7 @@ async def get_title_media(title_id: str, session: Db):
 @app.get("/api/titles/{title_id}", response_model=TitleOut)
 def get_public_title(title_id: str, session: Db):
     title = session.get(Title, title_id)
-    if title is None:
+    if title is None or not title.verified:
         raise HTTPException(status_code=404, detail="Title not found")
     return title_out(title)
 
@@ -557,6 +591,7 @@ def get_public_title(title_id: str, session: Db):
 def exact_catalog_matches(session: Session, name: str, media_type: str) -> list[Title]:
     found = session.scalars(select(Title).join(TitleAlias, TitleAlias.title_id == Title.id).where(
         Title.media_type == media_type,
+        Title.verified.is_(True),
         TitleAlias.normalized == normalize_name(name),
     )).all()
     return list({title.id: title for title in found}.values())
@@ -933,6 +968,87 @@ def csv_safe(value: str) -> str:
     return f"'{value}" if value.lstrip().startswith(("=", "+", "-", "@")) else value
 
 
+def import_entry_snapshot(entry: LibraryEntry) -> dict:
+    return {**entry_snapshot(entry), "created_at": as_utc(entry.created_at).isoformat(),
+            "updated_at": as_utc(entry.updated_at).isoformat()}
+
+
+def import_change(session: Session, batch: ImportBatch, sequence: int, kind: str,
+                  before: dict | None, after: dict | None, title_id: str | None = None,
+                  season_number: int | None = None) -> bool:
+    if before == after:
+        return False
+    session.add(ImportChange(batch_id=batch.id, sequence=sequence, object_kind=kind,
+        title_id=title_id, season_number=season_number,
+        before_json=json.dumps(before) if before else None,
+        after_json=json.dumps(after) if after else None))
+    return True
+
+
+def backup_title(session: Session, item: TitleOut) -> tuple[Title, bool]:
+    allowed = {"tmdb": {"movie", "tv"}, "igdb": {"game"},
+               "tvmaze": {"tv"}, "rawg": {"game"}}
+    if (item.provider not in allowed or item.media_type not in allowed[item.provider]
+        or not item.provider_id.isdigit() or len(item.provider_id) > 64
+        or len(item.name.strip()) < 2 or len(item.name) > 500):
+        raise HTTPException(status_code=422, detail="Backup contains an unsupported title identity")
+    identity = session.scalar(select(TitleIdentity).where(TitleIdentity.namespace == item.provider,
+        TitleIdentity.media_type == item.media_type, TitleIdentity.external_id == item.provider_id))
+    title = session.get(Title, identity.title_id) if identity else session.scalar(select(Title).where(
+        Title.provider == item.provider, Title.media_type == item.media_type,
+        Title.provider_id == item.provider_id))
+    if title:
+        if identity is None:
+            session.add(TitleIdentity(title_id=title.id, namespace=item.provider,
+                media_type=item.media_type, external_id=item.provider_id))
+            session.flush()
+        return title, False
+    poster_hosts = {"tmdb": "https://image.tmdb.org/", "igdb": "https://images.igdb.com/",
+                    "tvmaze": "https://static.tvmaze.com/", "rawg": "https://media.rawg.io/"}
+    title = Title(provider=item.provider, media_type=item.media_type, provider_id=item.provider_id,
+        verified=False, name=item.name.strip(), overview=item.overview[:10000],
+        poster_url=item.poster_url if item.poster_url and item.poster_url.startswith(poster_hosts[item.provider]) else None,
+        release_date=item.release_date)
+    session.add(title)
+    session.flush()
+    session.add(TitleIdentity(title_id=title.id, namespace=item.provider,
+        media_type=item.media_type, external_id=item.provider_id))
+    return title, True
+
+
+def ensure_import_list(session: Session, user: CatalogUser, name: str,
+                       known: dict[str, CustomList], created: list[str]) -> CustomList:
+    normalized = " ".join(name.split())
+    if not normalized or len(normalized) > 80:
+        raise HTTPException(status_code=422, detail="Backup contains an invalid list name")
+    key = normalized.casefold()
+    item = known.get(key)
+    if item is None:
+        if len(known) >= 50:
+            raise HTTPException(status_code=422, detail="A library can have at most 50 lists")
+        item = CustomList(user_id=user.id, name=normalized)
+        session.add(item)
+        session.flush()
+        known[key] = item
+        created.append(normalized)
+    return item
+
+
+def apply_import_entry(session: Session, entry: LibraryEntry, data: dict,
+                       user: CatalogUser, known: dict[str, CustomList], created: list[str]) -> None:
+    entry.status = data["status"]
+    entry.completed_on = date.fromisoformat(data["completed_on"]) if data.get("completed_on") else None
+    entry.date_precision = data["date_precision"]
+    entry.rating_half_steps = data.get("rating_half_steps")
+    entry.review = data.get("review")
+    entry.favorite = bool(data.get("favorite"))
+    entry.platforms_json = json.dumps(data.get("platforms") or [])
+    entry.created_at = datetime.fromisoformat(data["created_at"]) if data.get("created_at") else utc_now()
+    entry.updated_at = datetime.fromisoformat(data["updated_at"]) if data.get("updated_at") else utc_now()
+    resolved = [ensure_import_list(session, user, name, known, created) for name in data.get("lists") or []]
+    set_entry_lists(session, entry, resolved)
+
+
 @app.get("/api/export/backup")
 def export_native_backup(session: Db, clerk_user_id: ClerkUser):
     user = find_user(session, clerk_user_id, create=True)
@@ -945,12 +1061,12 @@ def export_native_backup(session: Db, clerk_user_id: ClerkUser):
         "profile": {"display_name": public_display_name(user)},
         "lists": [item.name for item in lists],
         "entries": [{"title": title_out(entry.title).model_dump(mode="json"), **entry_snapshot(entry),
-                     "created_at": entry.created_at.isoformat(), "updated_at": entry.updated_at.isoformat()}
+                     "created_at": as_utc(entry.created_at).isoformat(), "updated_at": as_utc(entry.updated_at).isoformat()}
                     for entry in entries],
         "season_progress": [{"provider": session.get(Title, mark.title_id).provider,
                              "provider_id": session.get(Title, mark.title_id).provider_id,
                              "season_number": mark.season_number, "through_episode": mark.through_episode,
-                             "marked_at": mark.marked_at.isoformat()} for mark in marks],
+                             "marked_at": as_utc(mark.marked_at).isoformat()} for mark in marks],
     }
     return Response(content=json.dumps(payload, ensure_ascii=False), media_type="application/json",
                     headers={"Content-Disposition": 'attachment; filename="media-catalog-backup.json"',
@@ -976,6 +1092,190 @@ def export_generic_csv(session: Db, clerk_user_id: ClerkUser):
     return Response(content=output.getvalue(), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": 'attachment; filename="media-catalog.csv"',
                              "Cache-Control": "no-store"})
+
+
+@app.post("/api/imports/backup")
+def import_native_backup(backup: NativeBackupIn, session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=True)
+    assert user is not None
+    identities = [(entry.title.provider, entry.title.media_type, entry.title.provider_id) for entry in backup.entries]
+    if len(identities) != len(set(identities)):
+        raise HTTPException(status_code=422, detail="Backup contains the same title more than once")
+    known = {item.name.casefold(): item for item in session.scalars(select(CustomList).where(CustomList.user_id == user.id)).all()}
+    created_lists: list[str] = []
+    batch = ImportBatch(user_id=user.id, source="native")
+    session.add(batch)
+    session.flush()
+    sequence = 0
+    created_entries = updated_entries = provisional = season_marks = 0
+    if backup.profile and backup.profile.display_name != user.display_name:
+        before = {"display_name": user.display_name}
+        user.display_name = backup.profile.display_name
+        sequence += 1
+        import_change(session, batch, sequence, "profile", before, {"display_name": user.display_name})
+    for name in backup.lists:
+        ensure_import_list(session, user, name, known, created_lists)
+    for item in backup.entries:
+        title, new_title = backup_title(session, item.title)
+        if new_title or not title.verified:
+            provisional += 1
+        entry = session.scalar(select(LibraryEntry).where(LibraryEntry.user_id == user.id,
+            LibraryEntry.title_id == title.id))
+        before = import_entry_snapshot(entry) if entry else None
+        if entry is None:
+            entry = LibraryEntry(user_id=user.id, title_id=title.id, status=item.status)
+            session.add(entry)
+            session.flush()
+        data = item.model_dump(mode="json", exclude={"title"})
+        apply_import_entry(session, entry, data, user, known, created_lists)
+        after = import_entry_snapshot(entry)
+        sequence += 1
+        if import_change(session, batch, sequence, "entry", before, after, title.id):
+            record_revision(session, user.id, title.id, before, after, source="import")
+            if before is None:
+                created_entries += 1
+            else:
+                updated_entries += 1
+    for item in backup.season_progress:
+        if not item.provider_id.isdigit() or as_utc(item.marked_at) > utc_now() + timedelta(minutes=5):
+            raise HTTPException(status_code=422, detail="Backup contains invalid TV progress")
+        identity = session.scalar(select(TitleIdentity).where(TitleIdentity.namespace == item.provider,
+            TitleIdentity.media_type == "tv", TitleIdentity.external_id == item.provider_id))
+        title = session.get(Title, identity.title_id) if identity else None
+        if title is None or title.media_type != "tv":
+            raise HTTPException(status_code=422, detail="Backup TV progress has no matching series")
+        progress = session.scalar(select(SeasonProgress).where(SeasonProgress.user_id == user.id,
+            SeasonProgress.title_id == title.id, SeasonProgress.season_number == item.season_number))
+        before = season_snapshot(progress) if progress else None
+        if progress is None:
+            progress = SeasonProgress(user_id=user.id, title_id=title.id, season_number=item.season_number)
+            session.add(progress)
+        progress.through_episode = item.through_episode
+        progress.marked_at = as_utc(item.marked_at)
+        after = season_snapshot(progress)
+        sequence += 1
+        if import_change(session, batch, sequence, "season", before, after, title.id, item.season_number):
+            record_revision(session, user.id, title.id, before, after, source="import")
+            season_marks += 1
+    batch.created_list_names_json = json.dumps(created_lists)
+    session.commit()
+    return {"batch_id": batch.id, "created": created_entries, "updated": updated_entries,
+            "provisional": provisional, "season_marks": season_marks,
+            "lists_created": len(created_lists)}
+
+
+def owned_import_batch(session: Session, clerk_user_id: str, batch_id: str) -> tuple[CatalogUser, ImportBatch]:
+    user = find_user(session, clerk_user_id, create=False)
+    batch = session.get(ImportBatch, batch_id)
+    if user is None or batch is None or batch.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Import not found")
+    return user, batch
+
+
+@app.get("/api/imports")
+def list_import_batches(session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=False)
+    if user is None:
+        return []
+    batches = session.scalars(select(ImportBatch).where(ImportBatch.user_id == user.id)
+        .order_by(ImportBatch.created_at.desc()).limit(30)).all()
+    return [{"id": batch.id, "source": batch.source, "created_at": batch.created_at,
+             "reverted_at": batch.reverted_at,
+             "changes": session.scalar(select(func.count(ImportChange.id)).where(
+                 ImportChange.batch_id == batch.id, ImportChange.reverted_at.is_(None)))} for batch in batches]
+
+
+@app.get("/api/imports/{batch_id}/changes")
+def list_import_changes(batch_id: str, session: Db, clerk_user_id: ClerkUser):
+    owned_import_batch(session, clerk_user_id, batch_id)
+    changes = session.scalars(select(ImportChange).where(ImportChange.batch_id == batch_id)
+        .order_by(ImportChange.sequence)).all()
+    return [{"id": change.id, "kind": change.object_kind,
+             "title": session.get(Title, change.title_id).name if change.title_id else None,
+             "reverted_at": change.reverted_at} for change in changes]
+
+
+def revert_import_change(session: Session, user: CatalogUser, change: ImportChange) -> bool:
+    if change.reverted_at is not None:
+        return True
+    before = json.loads(change.before_json) if change.before_json else None
+    after = json.loads(change.after_json) if change.after_json else None
+    if change.object_kind == "profile":
+        if {"display_name": user.display_name} != after:
+            return False
+        user.display_name = before["display_name"] if before else None
+    elif change.object_kind == "entry":
+        entry = session.scalar(select(LibraryEntry).where(LibraryEntry.user_id == user.id,
+            LibraryEntry.title_id == change.title_id))
+        if (import_entry_snapshot(entry) if entry else None) != after:
+            return False
+        if before is None:
+            session.delete(entry)
+            session.flush()
+        else:
+            known = {item.name.casefold(): item for item in session.scalars(select(CustomList).where(
+                CustomList.user_id == user.id)).all()}
+            apply_import_entry(session, entry, before, user, known, [])
+        record_revision(session, user.id, change.title_id, after, before, source="import_revert")
+    elif change.object_kind == "season":
+        progress = session.scalar(select(SeasonProgress).where(SeasonProgress.user_id == user.id,
+            SeasonProgress.title_id == change.title_id,
+            SeasonProgress.season_number == change.season_number))
+        if (season_snapshot(progress) if progress else None) != after:
+            return False
+        if before is None:
+            session.delete(progress)
+        else:
+            progress.through_episode = before["through_episode"]
+            progress.marked_at = datetime.fromisoformat(before["marked_at"])
+        record_revision(session, user.id, change.title_id, after, before, source="import_revert")
+    else:
+        return False
+    change.reverted_at = utc_now()
+    return True
+
+
+def finalize_import_revert(session: Session, batch: ImportBatch):
+    remaining = session.scalar(select(func.count(ImportChange.id)).where(
+        ImportChange.batch_id == batch.id, ImportChange.reverted_at.is_(None)))
+    if remaining == 0:
+        batch.reverted_at = utc_now()
+        for name in json.loads(batch.created_list_names_json or "[]"):
+            item = session.scalar(select(CustomList).where(CustomList.user_id == batch.user_id,
+                CustomList.name == name))
+            if item and not item.entry_links:
+                session.delete(item)
+
+
+@app.post("/api/imports/{batch_id}/revert")
+def revert_import_batch(batch_id: str, session: Db, clerk_user_id: ClerkUser):
+    user, batch = owned_import_batch(session, clerk_user_id, batch_id)
+    changes = session.scalars(select(ImportChange).where(ImportChange.batch_id == batch_id,
+        ImportChange.reverted_at.is_(None)).order_by(ImportChange.sequence.desc())).all()
+    reverted = skipped = 0
+    for change in changes:
+        if revert_import_change(session, user, change):
+            reverted += 1
+        else:
+            skipped += 1
+    session.flush()
+    finalize_import_revert(session, batch)
+    session.commit()
+    return {"reverted": reverted, "skipped_changed_since_import": skipped}
+
+
+@app.post("/api/imports/{batch_id}/changes/{change_id}/revert")
+def revert_selected_import_change(batch_id: str, change_id: str, session: Db, clerk_user_id: ClerkUser):
+    user, batch = owned_import_batch(session, clerk_user_id, batch_id)
+    change = session.get(ImportChange, change_id)
+    if change is None or change.batch_id != batch.id:
+        raise HTTPException(status_code=404, detail="Import change not found")
+    if not revert_import_change(session, user, change):
+        raise HTTPException(status_code=409, detail="This item changed since import; review it before reverting")
+    session.flush()
+    finalize_import_revert(session, batch)
+    session.commit()
+    return {"reverted": True}
 
 
 async def delete_clerk_user(clerk_user_id: str) -> None:
@@ -1005,7 +1305,10 @@ async def delete_account(session: Db, clerk_user_id: ClerkUser):
         session.execute(delete(EntryList).where(EntryList.entry_id.in_(entry_ids)))
     if list_ids:
         session.execute(delete(EntryList).where(EntryList.list_id.in_(list_ids)))
-    for model in (ShareLink, SeasonProgress, EntryRevision, LibraryEntry, CustomList):
+    batch_ids = list(session.scalars(select(ImportBatch.id).where(ImportBatch.user_id == user.id)))
+    if batch_ids:
+        session.execute(delete(ImportChange).where(ImportChange.batch_id.in_(batch_ids)))
+    for model in (ShareLink, SeasonProgress, EntryRevision, LibraryEntry, CustomList, ImportBatch):
         session.execute(delete(model).where(model.user_id == user.id))
     session.delete(user)
     session.commit()
@@ -1042,7 +1345,7 @@ def episode_watched(episode: dict, progress: SeasonProgress | None) -> bool:
 
 def season_snapshot(progress: SeasonProgress) -> dict:
     return {"season_number": progress.season_number, "through_episode": progress.through_episode,
-            "marked_at": progress.marked_at.isoformat()}
+            "marked_at": as_utc(progress.marked_at).isoformat()}
 
 
 @app.get("/api/library/{title_id}/seasons", response_model=list[SeasonOut])
