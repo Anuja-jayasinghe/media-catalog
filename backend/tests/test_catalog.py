@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 from catalog import main, database, limits
 from catalog import auth
 from catalog.auth import require_clerk_user
-from catalog.database import Base, CatalogRefreshCursor, CatalogUser, CustomList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, Title, TitleAlias, TitleIdentity
+from catalog.database import Base, CatalogRefreshCursor, CatalogUser, CustomList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SeasonProgress, Title, TitleAlias, TitleIdentity
 from catalog.providers import ProviderTitle
 from catalog import providers
 
@@ -334,6 +334,45 @@ def test_library_details_reject_invalid_values(client):
                    {"platforms": ["PC"]}, {"review": "a" * 10001}):
         response = http.put(path, json={"status": "completed", **change})
         assert response.status_code == 422
+
+
+def test_tv_progress_uses_dashboard_mark_time_and_keeps_future_episodes_unwatched(client, monkeypatch):
+    http, sessions = client
+    with sessions() as session:
+        show = Title(provider="tmdb", media_type="tv", provider_id="55", name="Example show")
+        session.add(show)
+        session.commit()
+        title_id = show.id
+    today = database.utc_now().date()
+    episodes = [
+        {"number": 1, "name": "Pilot", "air_date": today - timedelta(days=30)},
+        {"number": 2, "name": "Second", "air_date": today - timedelta(days=1)},
+        {"number": 3, "name": "Coming soon", "air_date": today + timedelta(days=30)},
+        {"number": 4, "name": "Date unknown", "air_date": None},
+    ]
+    async def fake_seasons(*_):
+        return [{"number": 1, "name": "Season 1", "episode_count": 4}]
+    async def fake_episodes(*_):
+        return episodes
+    monkeypatch.setattr(main, "tv_seasons", fake_seasons)
+    monkeypatch.setattr(main, "tv_episodes", fake_episodes)
+    path = f"/api/library/{title_id}/seasons/1"
+    alice = {"X-Test-User": "alice"}
+    bob = {"X-Test-User": "bob"}
+    assert http.get(f"/api/library/{title_id}/seasons", headers=alice).json()[0]["marked_at"] is None
+    partial = http.put(path, headers=alice, json={"through_episode": 1})
+    assert partial.status_code == 200
+    assert [item["watched"] for item in partial.json()] == [True, False, False, False]
+    assert all(not item["watched"] for item in http.get(path, headers=bob).json())
+    assert http.put(path, headers=alice, json={"through_episode": 3}).status_code == 422
+    full = http.put(path, headers=alice, json={})
+    assert [item["watched"] for item in full.json()] == [True, True, False, False]
+    assert http.get("/api/library", headers=alice).json()[0]["status"] == "in_progress"
+    assert http.delete(path, headers=alice).status_code == 204
+    assert all(not item["watched"] for item in http.get(path, headers=alice).json())
+    with sessions() as session:
+        assert session.scalars(select(SeasonProgress)).all() == []
+        assert len(session.scalars(select(EntryRevision).where(EntryRevision.source == "season")).all()) == 3
 
 
 def test_unknown_title_cannot_be_saved(client):
