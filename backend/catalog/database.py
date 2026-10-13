@@ -8,7 +8,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 
@@ -86,8 +86,93 @@ class SearchSnapshot(Base):
     result_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class TitleIdentity(Base):
+    """An exact provider or external ID attached to a canonical title."""
+
+    __tablename__ = "title_identities"
+    __table_args__ = (UniqueConstraint("namespace", "media_type", "external_id", name="uq_title_identity"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    title_id: Mapped[str] = mapped_column(ForeignKey("titles.id", ondelete="CASCADE"), index=True)
+    namespace: Mapped[str] = mapped_column(String(32))
+    media_type: Mapped[str] = mapped_column(String(8))
+    external_id: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class TitleAlias(Base):
+    """Search text; aliases never establish identity on their own."""
+
+    __tablename__ = "title_aliases"
+    __table_args__ = (UniqueConstraint("title_id", "normalized", name="uq_title_alias"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    title_id: Mapped[str] = mapped_column(ForeignKey("titles.id", ondelete="CASCADE"), index=True)
+    value: Mapped[str] = mapped_column(String(500))
+    normalized: Mapped[str] = mapped_column(String(500), index=True)
+    source: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class MissingTitleReport(Base):
+    __tablename__ = "missing_title_reports"
+    __table_args__ = (UniqueConstraint("media_type", "normalized_name", name="uq_missing_title"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    media_type: Mapped[str] = mapped_column(String(8), index=True)
+    name: Mapped[str] = mapped_column(String(500))
+    normalized_name: Mapped[str] = mapped_column(String(500), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="open")
+    resolved_title_id: Mapped[str | None] = mapped_column(ForeignKey("titles.id"))
+    github_issue_number: Mapped[int | None] = mapped_column(Integer)
+    github_issue_url: Mapped[str | None] = mapped_column(Text)
+    github_issue_closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    admin_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class ReportSubscriber(Base):
+    __tablename__ = "report_subscribers"
+    __table_args__ = (UniqueConstraint("report_id", "email", name="uq_report_subscriber"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    report_id: Mapped[str] = mapped_column(ForeignKey("missing_title_reports.id", ondelete="CASCADE"), index=True)
+    email: Mapped[str] = mapped_column(String(320))
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    delivery_id: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 def init_database() -> None:
     Base.metadata.create_all(engine)
+    # Older development databases already have this table. create_all does not
+    # add columns to existing tables, so apply the two additive report fields.
+    with engine.begin() as connection:
+        columns = {column["name"] for column in inspect(connection).get_columns("missing_title_reports")}
+        timestamp_type = DateTime(timezone=True).compile(dialect=engine.dialect)
+        for column in ("github_issue_closed_at", "admin_notified_at"):
+            if column not in columns:
+                connection.execute(text(f"ALTER TABLE missing_title_reports ADD COLUMN {column} {timestamp_type}"))
+    # Existing local records predate the identity and alias tables.
+    from .identity import normalize_name
+
+    with SessionLocal() as session:
+        for title in session.scalars(select(Title)).all():
+            if session.scalar(select(TitleIdentity.id).where(
+                TitleIdentity.namespace == title.provider,
+                TitleIdentity.media_type == title.media_type,
+                TitleIdentity.external_id == title.provider_id,
+            )) is None:
+                session.add(TitleIdentity(title_id=title.id, namespace=title.provider,
+                                          media_type=title.media_type, external_id=title.provider_id))
+            key = normalize_name(title.name)
+            if key and session.scalar(select(TitleAlias.id).where(
+                TitleAlias.title_id == title.id, TitleAlias.normalized == key,
+            )) is None:
+                session.add(TitleAlias(title_id=title.id, value=title.name,
+                                       normalized=key, source=title.provider))
+        session.commit()
 
 
 if __name__ == "__main__":

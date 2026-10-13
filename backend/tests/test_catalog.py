@@ -8,13 +8,13 @@ import httpx
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, inspect, select
 from sqlalchemy.orm import sessionmaker
 
-from catalog import main
+from catalog import main, database
 from catalog import auth
 from catalog.auth import require_clerk_user
-from catalog.database import Base, CatalogUser, LibraryEntry, Title
+from catalog.database import Base, CatalogUser, LibraryEntry, MissingTitleReport, ReportSubscriber, Title, TitleAlias, TitleIdentity
 from catalog.providers import ProviderTitle
 from catalog import providers
 
@@ -216,3 +216,174 @@ def test_clerk_verification_uses_session_subject(monkeypatch):
     assert require_clerk_user(request) == "user_123"
     assert captured["options"].authorized_parties == ["http://localhost:3000"]
     assert captured["options"].accepts_token == ["session_token"]
+
+
+def test_exact_external_identity_joins_sources_without_merging_same_name(client):
+    _, sessions = client
+    with sessions() as session:
+        tvmaze = ProviderTitle("tvmaze", "tv", "12", "The Return", "", None, None,
+                               external_ids=(("imdb", "tt1234567"),))
+        tmdb = ProviderTitle("tmdb", "tv", "98", "Return, The", "", None, None,
+                             external_ids=(("imdb", "tt1234567"),))
+        first = main.persist_titles(session, [tvmaze])[0]
+        canonical_id = first.id
+        merged = main.persist_titles(session, [tmdb])[0]
+        assert merged.id == canonical_id
+        assert merged.provider == "tmdb"
+        unrelated = main.persist_titles(session, [ProviderTitle("tmdb", "tv", "99", "The Return", "", None, None)])[0]
+        assert unrelated.id != canonical_id
+        session.commit()
+        aliases = {item.value for item in session.scalars(select(TitleAlias).where(TitleAlias.title_id == canonical_id))}
+        assert {"The Return", "Return, The"} <= aliases
+        assert len(session.scalars(select(TitleIdentity)).all()) == 4
+
+
+def test_alias_search_survives_provider_outage(client, monkeypatch):
+    http, sessions = client
+    with sessions() as session:
+        main.persist_titles(session, [ProviderTitle("tmdb", "movie", "7", "Amélie", "", None, None,
+                                                   aliases=("Le Fabuleux Destin d’Amélie Poulain",))])
+        session.commit()
+
+    async def unavailable(*_):
+        raise providers.ProviderSearchError("offline")
+
+    monkeypatch.setattr(main, "search_providers", unavailable)
+    result = http.get("/api/search", params={"q": "Le Fabuleux"})
+    assert result.status_code == 200
+    assert result.json()["results"][0]["name"] == "Amélie"
+
+
+def test_newly_published_title_appears_during_search_snapshot(client, monkeypatch):
+    http, sessions = client
+
+    async def empty_search(*_):
+        return [], []
+
+    monkeypatch.setattr(main, "search_providers", empty_search)
+    first = http.get("/api/search", params={"q": "Hidden Film", "media_type": "movie"})
+    assert first.json()["results"] == []
+    with sessions() as session:
+        main.persist_titles(session, [ProviderTitle("tmdb", "movie", "91", "Hidden Film", "", None, None)])
+        session.commit()
+    second = http.get("/api/search", params={"q": "Hidden Film", "media_type": "movie"})
+    assert second.json()["cached"] is True
+    assert [title["name"] for title in second.json()["results"]] == ["Hidden Film"]
+
+
+def test_missing_report_is_deduped_and_email_stays_private(client, monkeypatch):
+    http, sessions = client
+
+    async def empty_search(*_):
+        return [], []
+
+    async def fake_issue(report):
+        assert not hasattr(report, "email")
+        return 17, "https://github.com/example/catalog/issues/17"
+
+    monkeypatch.setattr(main, "search_providers", empty_search)
+    monkeypatch.setattr(main, "create_github_issue", fake_issue)
+    one = http.post("/api/missing-titles", json={"name": "Lost Film", "media_type": "movie", "email": "a@example.com"})
+    two = http.post("/api/missing-titles", json={"name": "lost-film", "media_type": "movie", "email": "b@example.com"})
+    assert one.status_code == two.status_code == 200
+    assert one.json()["report_id"] == two.json()["report_id"]
+    assert "email" not in str(one.json())
+    with sessions() as session:
+        assert len(session.scalars(select(MissingTitleReport)).all()) == 1
+        assert {item.email for item in session.scalars(select(ReportSubscriber))} == {"a@example.com", "b@example.com"}
+
+
+def test_ambiguous_name_offers_choices_before_reporting(client, monkeypatch):
+    http, sessions = client
+
+    async def two_titles(*_):
+        return [
+            ProviderTitle("igdb", "game", "10", "Hades", "", None, date(2018, 12, 6)),
+            ProviderTitle("igdb", "game", "11", "Hades", "", None, date(2020, 9, 17)),
+        ], []
+
+    monkeypatch.setattr(main, "search_providers", two_titles)
+    result = http.post("/api/missing-titles", json={"name": "Hades", "media_type": "game"})
+    assert result.status_code == 200
+    assert result.json()["status"] == "choices"
+    assert len(result.json()["choices"]) == 2
+    with sessions() as session:
+        assert session.scalars(select(MissingTitleReport)).all() == []
+    forced = http.post("/api/missing-titles", json={"name": "Hades", "media_type": "game", "force_report": True})
+    assert forced.json()["status"] == "reported"
+
+
+def test_reconcile_notifies_once_after_public_title_exists(client, monkeypatch):
+    http, sessions = client
+    sent = []
+
+    async def empty_search(*_):
+        return [], []
+
+    async def found_search(*_):
+        return [ProviderTitle("tmdb", "movie", "24", "Hidden Film", "", None, None)], []
+
+    async def fake_email(report, subscriber, title):
+        sent.append((subscriber.email, title.id))
+        return "delivery-1"
+
+    monkeypatch.setattr(main, "search_providers", empty_search)
+    monkeypatch.setattr(main, "send_publication_email", fake_email)
+    response = http.post("/api/missing-titles", json={"name": "Hidden Film", "media_type": "movie", "email": "watcher@example.com"})
+    assert response.json()["status"] == "reported"
+    monkeypatch.setattr(main, "search_providers", found_search)
+    monkeypatch.setenv("CATALOG_JOB_TOKEN", "test-job-token")
+    assert http.post("/api/internal/reconcile").status_code == 401
+    headers = {"Authorization": "Bearer test-job-token"}
+    first = http.post("/api/internal/reconcile", headers=headers)
+    second = http.post("/api/internal/reconcile", headers=headers)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["resolved"] == 1
+    assert len(sent) == 1
+    with sessions() as session:
+        report = session.scalar(select(MissingTitleReport))
+        assert report.status == "resolved"
+        assert http.get(f"/api/titles/{report.resolved_title_id}").status_code == 200
+        assert session.scalar(select(ReportSubscriber)).notified_at is not None
+
+
+def test_tvmaze_fallback_when_tmdb_has_no_close_series(monkeypatch):
+    monkeypatch.setenv("TMDB_READ_TOKEN", "test-token")
+    original_client = httpx.AsyncClient
+    calls = []
+
+    def respond(request):
+        calls.append(str(request.url))
+        if request.url.host == "api.themoviedb.org":
+            return httpx.Response(200, json={"results": [], "total_pages": 1})
+        if request.url.host == "api.tvmaze.com":
+            return httpx.Response(200, json=[{"score": 0.9, "show": {
+                "id": 55, "name": "Rare Series", "summary": "<p>A small show.</p>",
+                "premiered": "2025-02-01", "image": None,
+                "externals": {"imdb": "tt1234567"},
+            }}])
+        return httpx.Response(404)
+
+    def fake_client(*args, **kwargs):
+        return original_client(transport=httpx.MockTransport(respond), *args, **kwargs)
+
+    monkeypatch.setattr(providers.httpx, "AsyncClient", fake_client)
+    titles, warnings = asyncio.run(providers.search_providers("Rare Series", "tv"))
+    assert warnings == []
+    assert len(titles) == 1
+    assert titles[0].provider == "tvmaze"
+    assert titles[0].external_ids == (("imdb", "tt1234567"),)
+    assert titles[0].overview == "A small show."
+    assert any("tvmaze.com" in url for url in calls)
+
+
+def test_existing_report_table_gets_additive_columns(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy.sqlite3'}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE missing_title_reports (id VARCHAR(32) PRIMARY KEY, media_type VARCHAR(8), name VARCHAR(500), normalized_name VARCHAR(500), status VARCHAR(16), resolved_title_id VARCHAR(32), github_issue_number INTEGER, github_issue_url TEXT, created_at DATETIME, updated_at DATETIME)")
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine, expire_on_commit=False))
+    database.init_database()
+    columns = {column["name"] for column in inspect(engine).get_columns("missing_title_reports")}
+    assert {"github_issue_closed_at", "admin_notified_at"} <= columns
+    engine.dispose()
