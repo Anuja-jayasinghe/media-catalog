@@ -9,6 +9,7 @@ import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from catalog import main, database
@@ -197,6 +198,23 @@ def test_library_fails_closed_without_clerk_configuration(monkeypatch):
     main.app.dependency_overrides.clear()
     response = TestClient(main.app).get("/api/library")
     assert response.status_code == 503
+
+
+def test_readiness_checks_database_without_exposing_connection_details(client):
+    http, _ = client
+    assert http.get("/health/ready").json() == {"status": "ready"}
+
+    class UnavailableSession:
+        def execute(self, _statement):
+            raise SQLAlchemyError("private connection details")
+
+    def unavailable_session():
+        yield UnavailableSession()
+
+    main.app.dependency_overrides[main.get_session] = unavailable_session
+    response = http.get("/health/ready")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Catalog database is unavailable"}
 
 
 def test_clerk_verification_uses_session_subject(monkeypatch):
