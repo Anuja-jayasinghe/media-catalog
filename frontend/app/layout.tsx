@@ -3,7 +3,7 @@ import { ClerkProvider } from "@clerk/nextjs";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Media Catalog",
+  title: "MTGL",
   description: "A home for the movies, shows, and games you remember.",
 };
 
