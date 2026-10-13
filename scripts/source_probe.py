@@ -130,10 +130,10 @@ def run_search(items: list[dict], delay: float) -> int:
                 graded += 1
                 found_top_1 += match_rank == 1
                 found_top_5 += match_rank is not None and match_rank <= 5
-            print(json.dumps({"query": item["query"], "media_type": item["media_type"], "expected_title": item["expected_title"], "expected_year": item.get("expected_year"), "match_rank": match_rank, "candidates": candidates[:5], "latency_ms": round((time.monotonic() - started) * 1000)}))
+            print(json.dumps({"query": item["query"], "media_type": item["media_type"], "expected_id": expected_id, "bucket": item.get("bucket"), "expected_title": item["expected_title"], "expected_year": item.get("expected_year"), "match_rank": match_rank, "candidates": candidates[:5], "latency_ms": round((time.monotonic() - started) * 1000)}))
         except RuntimeError as error:
             errors += 1
-            print(json.dumps({"query": item["query"], "media_type": item["media_type"], "error": str(error)}))
+            print(json.dumps({"query": item["query"], "media_type": item["media_type"], "expected_id": item.get("expected_id"), "bucket": item.get("bucket"), "error": str(error)}))
     print(json.dumps({"summary": {"queries": len(items), "graded_by_provider_id": graded, "top_1": found_top_1, "top_5": found_top_5, "errors": errors, "manual_review_required": len(items) - graded}}))
     return 1 if errors else 0
 
