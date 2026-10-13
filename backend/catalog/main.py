@@ -14,7 +14,8 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import func, select, tuple_
+from sqlalchemy import func, select, text, tuple_
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .auth import require_clerk_user
@@ -276,6 +277,16 @@ def snapshot_titles(session: Session, snapshot: SearchSnapshot) -> list[Title]:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/health/ready")
+def readiness(session: Db):
+    """Report whether the configured catalog database accepts queries."""
+    try:
+        session.execute(text("SELECT 1"))
+    except SQLAlchemyError as error:
+        raise HTTPException(status_code=503, detail="Catalog database is unavailable") from error
+    return {"status": "ready"}
 
 
 @app.get("/api/search", response_model=SearchOut)
