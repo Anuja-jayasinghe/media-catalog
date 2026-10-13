@@ -11,13 +11,15 @@ import uuid
 import httpx
 import hashlib
 import secrets
+import csv
+import io
 from urllib.parse import quote
 from hmac import compare_digest
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select, text, tuple_
@@ -919,6 +921,61 @@ def get_public_share(token: str, session: Db):
         entries=[SharedEntryOut(title=title_out(entry.title), status=entry.status,
             rating_half_steps=entry.rating_half_steps,
             lists=sorted((link.custom_list.name for link in entry.list_links), key=str.casefold)) for entry in entries])
+
+
+def export_entries(session: Session, user: CatalogUser) -> list[LibraryEntry]:
+    return session.scalars(select(LibraryEntry).where(LibraryEntry.user_id == user.id)
+        .order_by(LibraryEntry.created_at, LibraryEntry.id)).all()
+
+
+def csv_safe(value: str) -> str:
+    # Spreadsheet programs can execute cells beginning with formula prefixes.
+    return f"'{value}" if value.lstrip().startswith(("=", "+", "-", "@")) else value
+
+
+@app.get("/api/export/backup")
+def export_native_backup(session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=True)
+    assert user is not None
+    entries = export_entries(session, user)
+    marks = session.scalars(select(SeasonProgress).where(SeasonProgress.user_id == user.id)).all()
+    lists = session.scalars(select(CustomList).where(CustomList.user_id == user.id).order_by(CustomList.name)).all()
+    payload = {
+        "format": "media-catalog-backup", "version": 1, "exported_at": utc_now().isoformat(),
+        "profile": {"display_name": public_display_name(user)},
+        "lists": [item.name for item in lists],
+        "entries": [{"title": title_out(entry.title).model_dump(mode="json"), **entry_snapshot(entry),
+                     "created_at": entry.created_at.isoformat(), "updated_at": entry.updated_at.isoformat()}
+                    for entry in entries],
+        "season_progress": [{"provider": session.get(Title, mark.title_id).provider,
+                             "provider_id": session.get(Title, mark.title_id).provider_id,
+                             "season_number": mark.season_number, "through_episode": mark.through_episode,
+                             "marked_at": mark.marked_at.isoformat()} for mark in marks],
+    }
+    return Response(content=json.dumps(payload, ensure_ascii=False), media_type="application/json",
+                    headers={"Content-Disposition": 'attachment; filename="media-catalog-backup.json"',
+                             "Cache-Control": "no-store"})
+
+
+@app.get("/api/export/csv")
+def export_generic_csv(session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=True)
+    assert user is not None
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["media_type", "title", "release_date", "provider", "provider_id", "status",
+                     "completed_on", "date_precision", "rating_5", "favorite", "platforms", "lists", "review"])
+    for entry in export_entries(session, user):
+        title = entry.title
+        writer.writerow([title.media_type, csv_safe(title.name), title.release_date.isoformat() if title.release_date else "",
+                         title.provider, title.provider_id, entry.status,
+                         entry.completed_on.isoformat() if entry.completed_on else "", entry.date_precision,
+                         entry.rating_half_steps / 2 if entry.rating_half_steps else "", str(bool(entry.favorite)).lower(),
+                         csv_safe("; ".join(json.loads(entry.platforms_json or "[]"))),
+                         csv_safe("; ".join(link.custom_list.name for link in entry.list_links)), csv_safe(entry.review or "")])
+    return Response(content=output.getvalue(), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="media-catalog.csv"',
+                             "Cache-Control": "no-store"})
 
 
 async def delete_clerk_user(clerk_user_id: str) -> None:
