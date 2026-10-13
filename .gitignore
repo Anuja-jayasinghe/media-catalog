@@ -2,8 +2,10 @@
 .env.*
 !.env.example
 node_modules/
+.next/
 .venv/
 __pycache__/
+*.sqlite3
 .DS_Store
 tmp/
 results/raw/

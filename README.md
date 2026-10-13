@@ -2,7 +2,9 @@
 
 An open-source, personal catalog for movies, TV series, and video games. The intended product will let each user search and browse a shared title catalog, then track what they have watched or played.
 
-This repository begins with source validation. No product implementation or API credentials are included yet. See [the source validation plan](docs/source-validation-plan.md) for the coverage, freshness, reliability, and load tests that must pass before choosing a product architecture.
+The confirmed product requirements and phased build plan are in [docs/product-requirements.md](docs/product-requirements.md). The first-release [architecture](docs/architecture.md), [authentication](docs/authentication-decision.md), [hosting](docs/hosting-decision.md), and [email](docs/email-decision.md) choices are documented separately.
+
+This repository began with source validation. The [catalog source decision](docs/catalog-decision.md) records a conditional go for product implementation based on the initial API checks and the planned missing-title flow. The broader [source validation plan](docs/source-validation-plan.md) remains available for measuring coverage, freshness, and reliability.
 
 ## Candidate sources
 
@@ -15,7 +17,30 @@ TheTVDB and RAWG are possible supplemental sources if the primary candidates hav
 
 ## Status
 
-Planning and source evaluation. The first milestone is a reproducible evidence report and a go/no-go decision for TMDB and IGDB.
+The first product slice now includes a Next.js interface, unified search and release browsing backed by TMDB and IGDB, a shared title table, and Clerk-protected personal library endpoints. The frontend supports public discovery without Clerk configuration; saving requires a Clerk application. Full catalog indexing, personalized recommendations, seasons, imports, and reporting remain planned. Catalog coverage and new-release freshness are still unmeasured beyond the initial smoke tests.
+
+## Run the product slice locally
+
+The existing root `.env` supplies TMDB and Twitch credentials to the Python API. To configure sign-in, copy `frontend/.env.example` to `frontend/.env.local` and `backend/.env.example` to `backend/.env`. Put your Clerk publishable and secret keys in the frontend file. Put the Clerk secret key, JWT public key, and allowed frontend origin in the backend file. Set the provider credentials in the backend file if they are not already in the root `.env`. Keep all secret keys out of Git.
+
+In one terminal:
+
+```sh
+cd backend
+uv sync --extra test
+uv run python -m catalog.database
+uv run uvicorn app:app --host 127.0.0.1 --port 8000
+```
+
+In a second terminal:
+
+```sh
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`. Search begins after two characters and searches all three media types together. With an empty search, the page browses recent and upcoming releases that refresh from providers automatically. Sign in to save a title with a tracking status and see it in **My library**. SQLite is the local default; the hosted deployment uses PostgreSQL through `DATABASE_URL`. See the [architecture note](docs/architecture.md) for the API and data model.
 
 ## First probes
 
