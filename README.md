@@ -17,7 +17,7 @@ TheTVDB and RAWG are possible supplemental sources if the primary candidates hav
 
 ## Status
 
-The first product slice now includes a Next.js interface, unified search and release browsing backed by TMDB and IGDB, a shared title table, and Clerk-protected personal library endpoints. The frontend supports public discovery without Clerk configuration; saving requires a Clerk application. Full catalog indexing, personalized recommendations, seasons, imports, and reporting remain planned. Catalog coverage and new-release freshness are still unmeasured beyond the initial smoke tests.
+The first product slice now includes a Next.js interface, separate movie, TV series, and game discovery pages, unified search with grouped results, a shared title table, and Clerk-protected personal library endpoints. Each discovery page loads additional provider results as the user scrolls. A title opens an available trailer; without one, movie and TV titles open IMDb when TMDB supplies an IMDb ID, otherwise TMDB. Games open IGDB when no video is available. The frontend supports public discovery without Clerk configuration; saving requires a Clerk application. Full catalog indexing, personalized recommendations, seasons, imports, and reporting remain planned. Catalog coverage and new-release freshness are still unmeasured beyond the initial smoke tests.
 
 The current mobile and desktop [interface direction](docs/interface-design.md) is a design iteration for review.
 
@@ -42,7 +42,9 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:3000`. Search begins after two characters and searches all three media types together. With an empty search, the page browses recent and upcoming releases that refresh from providers automatically. Sign in to save a title with a tracking status and see it in **My library**. SQLite is the local default; the hosted deployment uses PostgreSQL through `DATABASE_URL`. See the [architecture note](docs/architecture.md) for the API and data model.
+Open `http://localhost:3000`. The home page shows recent and upcoming titles in separate media sections. Movies, TV series, and Games each have Popular, New releases, and Coming soon collections that load more titles while scrolling. Search begins after two characters and groups results by media type. Use the plus control on a poster to track a title; opening the poster shows a trailer when available or sends you to its source page. Sign in to save a tracking status and see it in **My library**. SQLite is the local default; the hosted deployment uses PostgreSQL through `DATABASE_URL`. See the [architecture note](docs/architecture.md) for the API and data model.
+
+The browse API accepts `section=popular|recent|upcoming`, `media_type=movie|tv|game`, and `page=1..500`; responses include `has_more`. `GET /api/titles/{title_id}/media` resolves a trailer and external title link on demand. Provider pagination limits still apply.
 
 ## First probes
 
