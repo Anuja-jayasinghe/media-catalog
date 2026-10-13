@@ -8,7 +8,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, inspect, select, text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 
@@ -75,10 +75,51 @@ class LibraryEntry(Base):
     status: Mapped[str] = mapped_column(String(16))
     completed_on: Mapped[date | None] = mapped_column(Date)
     date_precision: Mapped[str] = mapped_column(String(8), default="none")
+    rating_half_steps: Mapped[int | None] = mapped_column(Integer)
+    review: Mapped[str | None] = mapped_column(Text)
+    favorite: Mapped[bool] = mapped_column(Boolean, default=False)
+    platforms_json: Mapped[str] = mapped_column(Text, default="[]")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
     user: Mapped[CatalogUser] = relationship(back_populates="entries")
     title: Mapped[Title] = relationship(back_populates="entries")
+    list_links: Mapped[list[EntryList]] = relationship(back_populates="entry", cascade="all, delete-orphan")
+
+
+class CustomList(Base):
+    __tablename__ = "custom_lists"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_user_list_name"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    user_id: Mapped[str] = mapped_column(ForeignKey("catalog_users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    entry_links: Mapped[list[EntryList]] = relationship(back_populates="custom_list", cascade="all, delete-orphan")
+
+
+class EntryList(Base):
+    __tablename__ = "entry_lists"
+    __table_args__ = (UniqueConstraint("entry_id", "list_id", name="uq_entry_list"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    entry_id: Mapped[str] = mapped_column(ForeignKey("library_entries.id", ondelete="CASCADE"), index=True)
+    list_id: Mapped[str] = mapped_column(ForeignKey("custom_lists.id", ondelete="CASCADE"), index=True)
+    entry: Mapped[LibraryEntry] = relationship(back_populates="list_links")
+    custom_list: Mapped[CustomList] = relationship(back_populates="entry_links")
+
+
+class EntryRevision(Base):
+    """Private operational audit trail; never returned by public endpoints."""
+
+    __tablename__ = "entry_revisions"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=lambda: uuid.uuid4().hex)
+    user_id: Mapped[str] = mapped_column(ForeignKey("catalog_users.id", ondelete="CASCADE"), index=True)
+    title_id: Mapped[str] = mapped_column(ForeignKey("titles.id", ondelete="CASCADE"), index=True)
+    source: Mapped[str] = mapped_column(String(24), default="manual")
+    before_json: Mapped[str | None] = mapped_column(Text)
+    after_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class SearchSnapshot(Base):
@@ -181,6 +222,16 @@ def init_database() -> None:
                 connection.execute(text(f"ALTER TABLE missing_title_reports ADD COLUMN {column} {timestamp_type}"))
         if "excluded_title_ids_json" not in columns:
             connection.execute(text("ALTER TABLE missing_title_reports ADD COLUMN excluded_title_ids_json TEXT DEFAULT '[]'"))
+        entry_columns = {column["name"] for column in inspect(connection).get_columns("library_entries")}
+        additions = {
+            "rating_half_steps": "INTEGER",
+            "review": "TEXT",
+            "favorite": "BOOLEAN DEFAULT FALSE",
+            "platforms_json": "TEXT DEFAULT '[]'",
+        }
+        for column, definition in additions.items():
+            if column not in entry_columns:
+                connection.execute(text(f"ALTER TABLE library_entries ADD COLUMN {column} {definition}"))
     # Existing local records predate the identity and alias tables.
     from .identity import normalize_name
 
