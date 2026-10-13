@@ -14,6 +14,7 @@ from itertools import zip_longest
 import httpx
 
 from .identity import close_name, normalize_name
+from .limits import ProviderRateLimited, reserve_provider_call
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,15 @@ def parse_date(value: str | None) -> date | None:
 
 class ProviderSearchError(Exception):
     pass
+
+
+async def provider_request(client: httpx.AsyncClient, provider: str, method: str, url: str, **kwargs) -> httpx.Response:
+    """Reserve a shared request slot before sending provider traffic."""
+    try:
+        await asyncio.to_thread(reserve_provider_call, provider)
+    except ProviderRateLimited as error:
+        raise ProviderSearchError(str(error)) from error
+    return await client.request(method, url, **kwargs)
 
 
 _igdb_token = ""
@@ -74,7 +84,7 @@ async def search_tmdb(client: httpx.AsyncClient, query: str, media_type: str) ->
     token = os.getenv("TMDB_READ_TOKEN")
     if not token:
         raise ProviderSearchError("TMDB credentials are missing")
-    response = await client.get(
+    response = await provider_request(client, "tmdb", "GET",
         f"https://api.themoviedb.org/3/search/{media_type}",
         params={"query": query, "include_adult": "false", "page": 1},
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -86,7 +96,7 @@ async def search_tmdb(client: httpx.AsyncClient, query: str, media_type: str) ->
     # has no close title, so an obscure exact match is not lost behind popular hits.
     if not any(close_name(query, item.get("title" if media_type == "movie" else "name") or "") for item in items):
         for page in range(2, min(int(payload.get("total_pages") or 1), 3) + 1):
-            more = await client.get(
+            more = await provider_request(client, "tmdb", "GET",
                 f"https://api.themoviedb.org/3/search/{media_type}",
                 params={"query": query, "include_adult": "false", "page": page},
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -127,7 +137,7 @@ async def search_igdb(client: httpx.AsyncClient, query: str) -> list[ProviderTit
         f'search "{escaped}"; '
         'fields id,name,first_release_date,summary,cover.image_id,alternative_names.name,version_parent,total_rating_count; limit 30;'
     )
-    response = await client.post(
+    response = await provider_request(client, "igdb", "POST",
         "https://api.igdb.com/v4/games",
         content=body.encode("utf-8"),
         headers={"Client-ID": client_id, "Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -169,7 +179,8 @@ async def browse_tmdb(client: httpx.AsyncClient, section: str, media_type: str, 
     if not token:
         raise ProviderSearchError("TMDB credentials are missing")
     date_field = "primary_release_date" if media_type == "movie" else "first_air_date"
-    params = {"include_adult": "false", "page": page, "sort_by": "popularity.desc"}
+    sort_by = "popularity.desc" if section == "popular" else f"{date_field}.{'desc' if section == 'recent' else 'asc'}"
+    params = {"include_adult": "false", "page": page, "sort_by": sort_by}
     if section != "popular":
         start, end = (
             (today - timedelta(days=90), today)
@@ -177,7 +188,7 @@ async def browse_tmdb(client: httpx.AsyncClient, section: str, media_type: str, 
             (today + timedelta(days=1), today + timedelta(days=180))
         )
         params.update({f"{date_field}.gte": start.isoformat(), f"{date_field}.lte": end.isoformat()})
-    response = await client.get(
+    response = await provider_request(client, "tmdb", "GET",
         f"https://api.themoviedb.org/3/discover/{media_type}",
         params=params,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -201,12 +212,13 @@ async def browse_igdb(client: httpx.AsyncClient, section: str, today: date, page
         start_ts = int(datetime.combine(start, datetime_time.min, timezone.utc).timestamp())
         end_ts = int(datetime.combine(end, datetime_time.min, timezone.utc).timestamp())
         date_filter = f"where first_release_date >= {start_ts} & first_release_date < {end_ts}; "
+    sort_by = "total_rating_count desc" if section == "popular" else f"first_release_date {'desc' if section == 'recent' else 'asc'}"
     body = (
         "fields id,name,first_release_date,summary,cover.image_id,total_rating_count; "
         f"{date_filter}"
-        f"sort total_rating_count desc; limit 20; offset {(page - 1) * 20};"
+        f"sort {sort_by}; limit 20; offset {(page - 1) * 20};"
     )
-    response = await client.post(
+    response = await provider_request(client, "igdb", "POST",
         "https://api.igdb.com/v4/games", content=body.encode("utf-8"),
         headers={"Client-ID": client_id, "Authorization": f"Bearer {token}", "Accept": "application/json"},
     )
@@ -232,7 +244,7 @@ async def browse_providers(section: str, media_type: str, today: date, page: int
     groups: list[list[ProviderTitle]] = []
     warnings: list[str] = []
     for name, response in zip(names, responses):
-        if isinstance(response, BaseException):
+        if isinstance(response, Exception):
             warnings.append(f"{name} browse is temporarily unavailable")
         else:
             groups.append(response)
@@ -244,7 +256,7 @@ async def browse_providers(section: str, media_type: str, today: date, page: int
 
 
 async def search_tvmaze(client: httpx.AsyncClient, query: str) -> list[ProviderTitle]:
-    response = await client.get(
+    response = await provider_request(client, "tvmaze", "GET",
         "https://api.tvmaze.com/search/shows", params={"q": query},
         headers={"User-Agent": "MediaCatalog/0.1 (open-source catalog)", "Accept": "application/json"},
     )
@@ -272,7 +284,7 @@ async def search_rawg(client: httpx.AsyncClient, query: str) -> list[ProviderTit
     key = os.getenv("RAWG_API_KEY")
     if not key:
         return []
-    response = await client.get(
+    response = await provider_request(client, "rawg", "GET",
         "https://api.rawg.io/api/games",
         params={"key": key, "search": query, "search_precise": "true", "page_size": 20},
         headers={"Accept": "application/json"},
@@ -299,7 +311,7 @@ async def title_media(provider: str, media_type: str, provider_id: str) -> dict[
             token = os.getenv("TMDB_READ_TOKEN")
             if not token:
                 raise ProviderSearchError("TMDB credentials are missing")
-            response = await client.get(
+            response = await provider_request(client, "tmdb", "GET",
                 f"https://api.themoviedb.org/3/{media_type}/{provider_id}",
                 params={"append_to_response": "videos,external_ids"},
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -318,7 +330,7 @@ async def title_media(provider: str, media_type: str, provider_id: str) -> dict[
             if not client_id:
                 raise ProviderSearchError("IGDB credentials are missing")
             token = await igdb_token(client)
-            response = await client.post(
+            response = await provider_request(client, "igdb", "POST",
                 "https://api.igdb.com/v4/games",
                 content=f"fields url,videos.video_id; where id = {int(provider_id)}; limit 1;".encode(),
                 headers={"Client-ID": client_id, "Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -330,7 +342,7 @@ async def title_media(provider: str, media_type: str, provider_id: str) -> dict[
             external = url if isinstance(url, str) and url.startswith("https://www.igdb.com/games/") else f"https://www.igdb.com/games/{provider_id}"
             return {"trailer_url": f"https://www.youtube-nocookie.com/embed/{video_id}" if video_id else None, "external_url": external, "external_label": "IGDB"}
         if provider == "tvmaze":
-            response = await client.get(f"https://api.tvmaze.com/shows/{int(provider_id)}")
+            response = await provider_request(client, "tvmaze", "GET", f"https://api.tvmaze.com/shows/{int(provider_id)}")
             response.raise_for_status()
             url = response.json().get("url") or ""
             external = url if isinstance(url, str) and url.startswith("https://www.tvmaze.com/shows/") else f"https://www.tvmaze.com/shows/{provider_id}"
@@ -339,7 +351,7 @@ async def title_media(provider: str, media_type: str, provider_id: str) -> dict[
             key = os.getenv("RAWG_API_KEY")
             if not key:
                 raise ProviderSearchError("RAWG credentials are missing")
-            response = await client.get(f"https://api.rawg.io/api/games/{int(provider_id)}", params={"key": key})
+            response = await provider_request(client, "rawg", "GET", f"https://api.rawg.io/api/games/{int(provider_id)}", params={"key": key})
             response.raise_for_status()
             slug = response.json().get("slug") or provider_id
             if not re.fullmatch(r"[a-z0-9-]+", slug):
@@ -366,7 +378,7 @@ async def search_providers(query: str, media_type: str) -> tuple[list[ProviderTi
     groups: list[list[ProviderTitle]] = []
     warnings: list[str] = []
     for name, response in zip(names, responses):
-        if isinstance(response, BaseException):
+        if isinstance(response, Exception):
             warnings.append(f"{name} search is temporarily unavailable")
         else:
             groups.append(response)
@@ -384,7 +396,7 @@ async def search_providers(query: str, media_type: str) -> tuple[list[ProviderTi
                 fallbacks.append(search_rawg(client, query))
                 labels.append("RAWG")
             for label, response in zip(labels, await asyncio.gather(*fallbacks, return_exceptions=True)):
-                if isinstance(response, BaseException):
+                if isinstance(response, Exception):
                     warnings.append(f"{label} search is temporarily unavailable")
                 else:
                     titles.extend(response)
