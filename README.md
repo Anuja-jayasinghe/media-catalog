@@ -2,7 +2,7 @@
 
 An open-source, personal catalog for movies, TV series, and video games. The intended product will let each user search and browse a shared title catalog, then track what they have watched or played.
 
-The confirmed product requirements and phased build plan are in [docs/product-requirements.md](docs/product-requirements.md). The first-release [architecture](docs/architecture.md), [authentication](docs/authentication-decision.md), [hosting](docs/hosting-decision.md), and [email](docs/email-decision.md) choices are documented separately.
+The confirmed product requirements and phased build plan are in [docs/product-requirements.md](docs/product-requirements.md). The first-release [architecture](docs/architecture.md), [authentication](docs/authentication-decision.md), [hosting](docs/hosting-decision.md), and [email](docs/email-decision.md) choices are documented separately. See [Neon setup](docs/neon-setup.md) to connect a database for your own instance.
 
 This repository began with source validation. The [catalog source decision](docs/catalog-decision.md) records a conditional go for product implementation based on the initial API checks and the planned missing-title flow. The broader [source validation plan](docs/source-validation-plan.md) remains available for measuring coverage, freshness, and reliability.
 
@@ -45,6 +45,8 @@ npm run dev
 ```
 
 Open `http://localhost:3000`. The home page shows recent and upcoming titles in separate media sections. Movies, TV series, and Games each have Popular, New releases, and Coming soon collections that load more titles while scrolling. Search begins after two characters and groups results by media type. Use the plus control on a poster to track a title; opening the poster shows a trailer when available or sends you to its source page. Sign in to save a tracking status and see it in **My library**. SQLite is the local default; the hosted deployment uses PostgreSQL through the pooled `DATABASE_URL`. Set `DATABASE_URL_UNPOOLED` to Neon's direct URL before running `python -m catalog.database` for production schema setup. See the [architecture note](docs/architecture.md) for the API and data model.
+
+`GET /health` checks the API process. `GET /health/ready` also checks the configured database and returns HTTP 503 if it cannot be queried.
 
 The browse API accepts `section=popular|recent|upcoming`, `media_type=movie|tv|game`, and `page=1..500`; responses include `has_more`. `GET /api/titles/{title_id}/media` resolves a trailer and external title link on demand. Provider pagination limits still apply.
 
