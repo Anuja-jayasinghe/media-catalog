@@ -1,0 +1,21 @@
+[project]
+name = "media-catalog-api"
+version = "0.1.0"
+description = "Shared catalog and personal library API"
+requires-python = ">=3.11"
+dependencies = [
+  "clerk-backend-api>=6,<8",
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "psycopg[binary]>=3.2,<4",
+  "python-dotenv>=1,<2",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

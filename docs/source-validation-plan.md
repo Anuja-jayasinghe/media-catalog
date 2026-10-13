@@ -41,7 +41,7 @@ Measure:
 - Discover/browse coverage across genre, year, region, popularity, and release window; pagination depth and duplicate frequency.
 - TV season/episode coverage and whether new episodes appear under an existing series rather than as separate series.
 
-**Initial acceptance targets:** at least 95% correct-work recall in the top five overall; at least 90% in each media-type and fixture bucket; no automatic selection of an incorrect work. These are product targets, not claims about the providers. Review any failed bucket before lowering a target or adding a second source.
+**Initial acceptance targets:** at least 95% correct-work recall in the top five overall; at least 90% in each media-type and fixture bucket; no automatic selection of an incorrect work during catalog search. These are product targets, not claims about the providers. Review any failed bucket before lowering a target or adding a second source. The separate import flow may use its predicted closest match after presenting an ambiguity prompt that the user skips; it must preserve provenance so the user can correct that match later.
 
 ## Phase 3 — New-release and update freshness
 
