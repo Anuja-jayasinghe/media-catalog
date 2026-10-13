@@ -1,5 +1,7 @@
 # Source validation plan
 
+Current product cadence: a shared-catalog refresh every two weeks, with live browse/search and a targeted freshness check before a missing-title report. The daily sync described in Phase 3 is an earlier test proposal, not the configured schedule. Its 48-hour target therefore measures live provider discoverability and on-demand availability rather than scheduled preloading alone.
+
 ## Decision to make
 
 Can TMDB and IGDB support one searchable, browsable catalog for movies, TV series, and games, including new and upcoming releases, without manual entry of each title?

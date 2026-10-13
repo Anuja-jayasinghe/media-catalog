@@ -241,11 +241,12 @@ def resolve_known_reports(session: Session, titles: list[Title]) -> None:
         tuple_(MissingTitleReport.media_type, MissingTitleReport.normalized_name).in_(keys),
     )).all()
     for report in reports:
+        excluded = set(json.loads(report.excluded_title_ids_json or "[]"))
         matches = session.scalars(select(Title).join(TitleAlias, TitleAlias.title_id == Title.id).where(
             Title.media_type == report.media_type,
             TitleAlias.normalized == report.normalized_name,
         )).all()
-        unique = {title.id: title for title in matches}
+        unique = {title.id: title for title in matches if title.id not in excluded}
         if len(unique) == 1:
             report.status = "resolved"
             report.resolved_title_id = next(iter(unique))
@@ -436,22 +437,77 @@ async def publish_report_operations(session: Session, report: MissingTitleReport
             session.rollback()
 
 
+async def refresh_release_pages_for_title(session: Session, name: str, media_type: str) -> None:
+    """Try current release pages once per title per hour before other fallbacks."""
+    key = f"missing-refresh:{media_type}:{normalize_name(name)}"
+    snapshot = session.get(SearchSnapshot, key)
+    fetched_at = snapshot.fetched_at if snapshot else None
+    if fetched_at and fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+    if fetched_at and utc_now() - fetched_at < timedelta(hours=1):
+        return
+
+    today = datetime.now(timezone.utc).date()
+    responses = await asyncio.gather(
+        browse_providers("recent", media_type, today, 1),
+        browse_providers("upcoming", media_type, today, 1),
+        return_exceptions=True,
+    )
+    refreshed: list[Title] = []
+    succeeded = 0
+    for response in responses:
+        if isinstance(response, asyncio.CancelledError):
+            raise response
+        if isinstance(response, Exception):
+            continue
+        found, warnings = response
+        if warnings:
+            continue
+        refreshed.extend(persist_titles(session, found))
+        succeeded += 1
+    if succeeded == 2:
+        values = {"key": key, "title_ids_json": json.dumps([title.id for title in refreshed]),
+                  "fetched_at": utc_now(), "result_count": len(refreshed)}
+        session.execute(upsert_statement(
+            SearchSnapshot, values, ["key"],
+            {field: values[field] for field in ("title_ids_json", "fetched_at", "result_count")},
+        ))
+    session.commit()
+
+
 @app.post("/api/missing-titles", response_model=MissingTitleOut)
 async def report_missing_title(payload: MissingTitleCreate, session: Db):
-    if not payload.force_report:
+    existing = exact_catalog_matches(session, payload.name, payload.media_type)
+    if not payload.force_report and len(existing) == 1:
+        return MissingTitleOut(status="found", title=title_out(existing[0]))
+    known_ids = {title.id for title in existing}
+    try:
+        await refresh_release_pages_for_title(session, payload.name, payload.media_type)
+    except ProviderSearchError:
+        pass
+    existing = exact_catalog_matches(session, payload.name, payload.media_type)
+    if payload.force_report:
+        newly_found = [title for title in existing if title.id not in known_ids]
+        if len(newly_found) == 1:
+            return MissingTitleOut(status="found", title=title_out(newly_found[0]))
+    elif len(existing) == 1:
+        return MissingTitleOut(status="found", title=title_out(existing[0]))
+
+    try:
+        found, _ = await search_providers(payload.name, payload.media_type)
+    except ProviderSearchError:
+        found = []
+    exact = [item for item in found if normalize_name(item.name) == normalize_name(payload.name)
+             or any(normalize_name(alias) == normalize_name(payload.name) for alias in item.aliases)]
+    if exact:
+        persist_titles(session, exact)
+        session.commit()
         existing = exact_catalog_matches(session, payload.name, payload.media_type)
-        if len(existing) == 1:
-            return MissingTitleOut(status="found", title=title_out(existing[0]))
-        try:
-            found, _ = await search_providers(payload.name, payload.media_type)
-        except ProviderSearchError:
-            found = []
-        exact = [item for item in found if normalize_name(item.name) == normalize_name(payload.name)
-                 or any(normalize_name(alias) == normalize_name(payload.name) for alias in item.aliases)]
-        if exact:
-            titles = persist_titles(session, exact)
-            session.commit()
-            existing = list({title.id: title for title in [*titles, *existing]}.values())
+    if payload.force_report:
+        newly_found = [title for title in existing if title.id not in known_ids]
+        if len(newly_found) == 1:
+            return MissingTitleOut(status="found", title=title_out(newly_found[0]))
+    else:
         if len(existing) == 1:
             return MissingTitleOut(status="found", title=title_out(existing[0]))
         if len(existing) > 1:
@@ -472,6 +528,9 @@ async def report_missing_title(payload: MissingTitleCreate, session: Db):
                                     normalized_name=key, status="open")
         session.add(report)
         session.flush()
+    if payload.force_report and known_ids and report.status == "open":
+        excluded = set(json.loads(report.excluded_title_ids_json or "[]"))
+        report.excluded_title_ids_json = json.dumps(sorted(excluded | known_ids))
     if payload.email and session.scalar(select(ReportSubscriber.id).where(
         ReportSubscriber.report_id == report.id, ReportSubscriber.email == payload.email,
     )) is None:
@@ -497,14 +556,16 @@ async def reconcile_missing_titles(
     ).order_by(MissingTitleReport.updated_at, MissingTitleReport.created_at).limit(20)).all()
     for report in open_reports:
         checked += 1
-        exact = exact_catalog_matches(session, report.name, report.media_type)
+        excluded = set(json.loads(report.excluded_title_ids_json or "[]"))
+        exact = [title for title in exact_catalog_matches(session, report.name, report.media_type)
+                 if title.id not in excluded]
         if not exact:
             try:
                 found, _ = await search_providers(report.name, report.media_type)
                 matches = [item for item in found if normalize_name(item.name) == report.normalized_name
                            or any(normalize_name(alias) == report.normalized_name for alias in item.aliases)]
                 if matches:
-                    exact = persist_titles(session, matches)
+                    exact = [title for title in persist_titles(session, matches) if title.id not in excluded]
                     session.commit()
             except Exception:
                 session.rollback()
@@ -562,15 +623,26 @@ REFRESH_LANES = (("movie", "recent"), ("tv", "recent"), ("game", "recent"),
 
 
 @app.post("/api/internal/refresh")
-async def refresh_catalog(session: Db, authorization: Annotated[str | None, Header()] = None):
-    """Refresh page one and one deeper page of a rotating release lane."""
+async def refresh_catalog(
+    session: Db,
+    authorization: Annotated[str | None, Header()] = None,
+    media_type: Literal["movie", "tv", "game"] | None = None,
+    section: Literal["recent", "upcoming"] | None = None,
+):
+    """Refresh page one and one deeper page of a selected or rotating lane."""
     require_job_authorization(authorization)
-    slot = session.get(CatalogRefreshCursor, "slot")
-    if slot is None:
-        slot = CatalogRefreshCursor(key="slot", next_page=1)
-        session.add(slot)
-    lane_index = (slot.next_page - 1) % len(REFRESH_LANES)
-    media_type, section = REFRESH_LANES[lane_index]
+    if (media_type is None) != (section is None):
+        raise HTTPException(status_code=422, detail="Provide both media_type and section")
+    slot = None
+    if media_type is None:
+        slot = session.get(CatalogRefreshCursor, "slot")
+        if slot is None:
+            slot = CatalogRefreshCursor(key="slot", next_page=1)
+            session.add(slot)
+        lane_index = (slot.next_page - 1) % len(REFRESH_LANES)
+        media_type, section = REFRESH_LANES[lane_index]
+    else:
+        lane_index = REFRESH_LANES.index((media_type, section))
     lane_key = f"{media_type}:{section}"
     cursor = session.get(CatalogRefreshCursor, lane_key)
     if cursor is None:
@@ -609,7 +681,7 @@ async def refresh_catalog(session: Db, authorization: Annotated[str | None, Head
         if page == deeper_page:
             cursor.next_page = page + 1 if len(found) >= 20 and page < 50 else 2
             cursor.updated_at = utc_now()
-    if 1 in counts:
+    if 1 in counts and slot is not None:
         slot.next_page = (lane_index + 1) % len(REFRESH_LANES) + 1
         slot.updated_at = utc_now()
     session.execute(delete(ProviderRateWindow).where(ProviderRateWindow.second < int(time.time()) - 86400))

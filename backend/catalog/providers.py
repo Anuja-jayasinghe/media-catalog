@@ -46,10 +46,16 @@ class ProviderSearchError(Exception):
 
 async def provider_request(client: httpx.AsyncClient, provider: str, method: str, url: str, **kwargs) -> httpx.Response:
     """Reserve a shared request slot before sending provider traffic."""
-    try:
-        await asyncio.to_thread(reserve_provider_call, provider)
-    except ProviderRateLimited as error:
-        raise ProviderSearchError(str(error)) from error
+    for attempt in range(2):
+        try:
+            await asyncio.to_thread(reserve_provider_call, provider)
+            break
+        except ProviderRateLimited as error:
+            if attempt:
+                raise ProviderSearchError(str(error)) from error
+            # A report may refresh both game feeds and then search IGDB. Let the
+            # shared counter advance to its next second before giving up.
+            await asyncio.sleep(max(0.05, 1.02 - time.time() % 1))
     return await client.request(method, url, **kwargs)
 
 
