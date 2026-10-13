@@ -15,13 +15,13 @@ from typing import Annotated, Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select, text, tuple_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .auth import require_clerk_user
-from .database import CatalogRefreshCursor, CatalogUser, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SessionLocal, Title, TitleAlias, TitleIdentity, engine, init_database, utc_now
+from .database import CatalogRefreshCursor, CatalogUser, CustomList, EntryList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SessionLocal, Title, TitleAlias, TitleIdentity, engine, init_database, utc_now
 from .identity import normalize_name
 from .providers import ProviderSearchError, ProviderTitle, browse_providers, search_providers, title_media
 from .reports import create_github_issue, close_github_issue, send_admin_email, send_publication_email
@@ -115,6 +115,11 @@ class TrackingUpdate(BaseModel):
     status: Literal["planned", "in_progress", "completed", "dropped"]
     completed_on: date | None = None
     date_precision: Literal["none", "day", "month"] = "none"
+    rating_half_steps: int | None = Field(default=None, ge=1, le=10)
+    review: str | None = Field(default=None, max_length=10000)
+    favorite: bool | None = None
+    platforms: list[str] | None = Field(default=None, max_length=20)
+    lists: list[str] | None = Field(default=None, max_length=20)
 
     @model_validator(mode="after")
     def valid_date(self):
@@ -126,13 +131,48 @@ class TrackingUpdate(BaseModel):
             raise ValueError("Month-only dates must use the first day of the month")
         return self
 
+    @field_validator("platforms", "lists")
+    @classmethod
+    def valid_labels(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        cleaned = [" ".join(value.split()) for value in values]
+        if any(not value or len(value) > 80 for value in cleaned):
+            raise ValueError("Names must be between 1 and 80 characters")
+        if len({value.casefold() for value in cleaned}) != len(cleaned):
+            raise ValueError("Names must be unique")
+        return cleaned
+
 
 class LibraryOut(BaseModel):
     title: TitleOut
     status: str
     completed_on: date | None
     date_precision: str
+    rating_half_steps: int | None
+    review: str | None
+    favorite: bool
+    platforms: list[str]
+    lists: list[str]
     updated_at: datetime
+
+
+class CustomListOut(BaseModel):
+    id: str
+    name: str
+    count: int
+
+
+class RenameList(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value: str) -> str:
+        value = " ".join(value.split())
+        if not value:
+            raise ValueError("A list needs a name")
+        return value
 
 
 def title_out(title: Title) -> TitleOut:
@@ -143,8 +183,31 @@ def entry_out(entry: LibraryEntry) -> LibraryOut:
     return LibraryOut(
         title=title_out(entry.title), status=entry.status,
         completed_on=entry.completed_on, date_precision=entry.date_precision,
+        rating_half_steps=entry.rating_half_steps, review=entry.review,
+        favorite=bool(entry.favorite), platforms=json.loads(entry.platforms_json or "[]"),
+        lists=sorted((link.custom_list.name for link in entry.list_links), key=str.casefold),
         updated_at=entry.updated_at,
     )
+
+
+def entry_snapshot(entry: LibraryEntry) -> dict:
+    return {
+        "status": entry.status,
+        "completed_on": entry.completed_on.isoformat() if entry.completed_on else None,
+        "date_precision": entry.date_precision,
+        "rating_half_steps": entry.rating_half_steps,
+        "review": entry.review,
+        "favorite": bool(entry.favorite),
+        "platforms": json.loads(entry.platforms_json or "[]"),
+        "lists": sorted((link.custom_list.name for link in entry.list_links), key=str.casefold),
+    }
+
+
+def record_revision(session: Session, user_id: str, title_id: str, before: dict | None, after: dict | None):
+    if before != after:
+        session.add(EntryRevision(user_id=user_id, title_id=title_id, source="manual",
+                                  before_json=json.dumps(before) if before else None,
+                                  after_json=json.dumps(after) if after else None))
 
 
 def upsert_statement(model, values: dict, constraint_columns: list[str], updates: dict):
@@ -715,6 +778,49 @@ def list_library(session: Db, clerk_user_id: ClerkUser):
     return [entry_out(entry) for entry in entries]
 
 
+@app.get("/api/lists", response_model=list[CustomListOut])
+def list_custom_lists(session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=False)
+    if user is None:
+        return []
+    lists = session.scalars(select(CustomList).where(CustomList.user_id == user.id).order_by(CustomList.name)).all()
+    return [CustomListOut(id=item.id, name=item.name, count=len(item.entry_links)) for item in lists]
+
+
+@app.put("/api/lists/{list_id}", response_model=CustomListOut)
+def rename_custom_list(list_id: str, change: RenameList, session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=False)
+    item = session.get(CustomList, list_id)
+    if user is None or item is None or item.user_id != user.id:
+        raise HTTPException(status_code=404, detail="List not found")
+    conflict = session.scalar(select(CustomList).where(CustomList.user_id == user.id,
+                              func.lower(CustomList.name) == change.name.casefold(), CustomList.id != list_id))
+    if conflict:
+        raise HTTPException(status_code=409, detail="A list with that name already exists")
+    if item.name != change.name:
+        # List names are stored in revisions, so a rename updates the log for each affected title.
+        previous = [(link.entry, entry_snapshot(link.entry)) for link in item.entry_links]
+        item.name = change.name
+        for entry, before in previous:
+            record_revision(session, user.id, entry.title_id, before, entry_snapshot(entry))
+        session.commit()
+    return CustomListOut(id=item.id, name=item.name, count=len(item.entry_links))
+
+
+@app.delete("/api/lists/{list_id}", status_code=204)
+def delete_custom_list(list_id: str, session: Db, clerk_user_id: ClerkUser):
+    user = find_user(session, clerk_user_id, create=False)
+    item = session.get(CustomList, list_id)
+    if user is None or item is None or item.user_id != user.id:
+        raise HTTPException(status_code=404, detail="List not found")
+    previous = [(link.entry, entry_snapshot(link.entry)) for link in item.entry_links]
+    session.delete(item)
+    session.flush()
+    for entry, before in previous:
+        record_revision(session, user.id, entry.title_id, before, entry_snapshot(entry))
+    session.commit()
+
+
 @app.put("/api/library/{title_id}", response_model=LibraryOut)
 def save_to_library(title_id: str, change: TrackingUpdate, session: Db, clerk_user_id: ClerkUser):
     title = session.get(Title, title_id)
@@ -723,13 +829,49 @@ def save_to_library(title_id: str, change: TrackingUpdate, session: Db, clerk_us
     user = find_user(session, clerk_user_id, create=True)
     assert user is not None
     entry = session.scalar(select(LibraryEntry).where(LibraryEntry.user_id == user.id, LibraryEntry.title_id == title.id))
+    before = entry_snapshot(entry) if entry else None
     if entry is None:
         entry = LibraryEntry(user_id=user.id, title_id=title.id, status=change.status)
         session.add(entry)
+        session.flush()
     entry.status = change.status
-    entry.completed_on = change.completed_on
-    entry.date_precision = change.date_precision
-    entry.updated_at = utc_now()
+    if change.status != "completed":
+        entry.completed_on = None
+        entry.date_precision = "none"
+    elif {"completed_on", "date_precision"} & change.model_fields_set or before is None:
+        entry.completed_on = change.completed_on
+        entry.date_precision = change.date_precision
+    if "rating_half_steps" in change.model_fields_set:
+        entry.rating_half_steps = change.rating_half_steps
+    if "review" in change.model_fields_set:
+        entry.review = change.review.strip() or None if change.review is not None else None
+    if "favorite" in change.model_fields_set:
+        entry.favorite = bool(change.favorite)
+    if "platforms" in change.model_fields_set:
+        if title.media_type != "game" and change.platforms:
+            raise HTTPException(status_code=422, detail="Platforms apply to games only")
+        entry.platforms_json = json.dumps(change.platforms or [])
+    if "lists" in change.model_fields_set:
+        desired = change.lists or []
+        existing = {item.name.casefold(): item for item in session.scalars(
+            select(CustomList).where(CustomList.user_id == user.id)).all()}
+        if len(existing) + len([name for name in desired if name.casefold() not in existing]) > 50:
+            raise HTTPException(status_code=422, detail="A library can have at most 50 lists")
+        resolved = []
+        for name in desired:
+            item = existing.get(name.casefold())
+            if item is None:
+                item = CustomList(user_id=user.id, name=name)
+                session.add(item)
+                session.flush()
+                existing[name.casefold()] = item
+            resolved.append(item)
+        entry.list_links = [EntryList(list_id=item.id) for item in resolved]
+        session.flush()
+    after = entry_snapshot(entry)
+    if before != after:
+        entry.updated_at = utc_now()
+        record_revision(session, user.id, title.id, before, after)
     session.commit()
     session.refresh(entry)
     return entry_out(entry)
@@ -742,6 +884,7 @@ def remove_from_library(title_id: str, session: Db, clerk_user_id: ClerkUser):
         return None
     entry = session.scalar(select(LibraryEntry).where(LibraryEntry.user_id == user.id, LibraryEntry.title_id == title_id))
     if entry is not None:
+        record_revision(session, user.id, title_id, entry_snapshot(entry), None)
         session.delete(entry)
         session.commit()
     return None
