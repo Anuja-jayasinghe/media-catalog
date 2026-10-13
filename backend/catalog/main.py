@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import asyncio
+import time
 import uuid
 from hmac import compare_digest
 from contextlib import asynccontextmanager
@@ -14,12 +16,12 @@ from typing import Annotated, Literal
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator, model_validator
-from sqlalchemy import func, select, text, tuple_
+from sqlalchemy import delete, func, select, text, tuple_
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .auth import require_clerk_user
-from .database import CatalogUser, LibraryEntry, MissingTitleReport, ReportSubscriber, SearchSnapshot, SessionLocal, Title, TitleAlias, TitleIdentity, engine, init_database, utc_now
+from .database import CatalogRefreshCursor, CatalogUser, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SessionLocal, Title, TitleAlias, TitleIdentity, engine, init_database, utc_now
 from .identity import normalize_name
 from .providers import ProviderSearchError, ProviderTitle, browse_providers, search_providers, title_media
 from .reports import create_github_issue, close_github_issue, send_admin_email, send_publication_email
@@ -488,11 +490,7 @@ async def reconcile_missing_titles(
     session: Db,
     authorization: Annotated[str | None, Header()] = None,
 ):
-    secret = os.getenv("CATALOG_JOB_TOKEN")
-    if not secret:
-        raise HTTPException(status_code=503, detail="Reconciliation is not configured")
-    if not authorization or not compare_digest(authorization, f"Bearer {secret}"):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    require_job_authorization(authorization)
     checked = resolved = notified = 0
     open_reports = session.scalars(select(MissingTitleReport).where(
         MissingTitleReport.status == "open",
@@ -549,6 +547,77 @@ async def reconcile_missing_titles(
             except Exception:
                 session.rollback()
     return {"checked": checked, "resolved": resolved, "notified": notified}
+
+
+def require_job_authorization(authorization: str | None) -> None:
+    secret = os.getenv("CATALOG_JOB_TOKEN")
+    if not secret:
+        raise HTTPException(status_code=503, detail="Catalog jobs are not configured")
+    if not authorization or not compare_digest(authorization, f"Bearer {secret}"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+REFRESH_LANES = (("movie", "recent"), ("tv", "recent"), ("game", "recent"),
+                 ("movie", "upcoming"), ("tv", "upcoming"), ("game", "upcoming"))
+
+
+@app.post("/api/internal/refresh")
+async def refresh_catalog(session: Db, authorization: Annotated[str | None, Header()] = None):
+    """Refresh page one and one deeper page of a rotating release lane."""
+    require_job_authorization(authorization)
+    slot = session.get(CatalogRefreshCursor, "slot")
+    if slot is None:
+        slot = CatalogRefreshCursor(key="slot", next_page=1)
+        session.add(slot)
+    lane_index = (slot.next_page - 1) % len(REFRESH_LANES)
+    media_type, section = REFRESH_LANES[lane_index]
+    lane_key = f"{media_type}:{section}"
+    cursor = session.get(CatalogRefreshCursor, lane_key)
+    if cursor is None:
+        cursor = CatalogRefreshCursor(key=lane_key, next_page=2)
+        session.add(cursor)
+    deeper_page = max(2, cursor.next_page)
+    today = datetime.now(timezone.utc).date()
+    pages = (1, deeper_page)
+    responses = await asyncio.gather(
+        *(browse_providers(section, media_type, today, page) for page in pages),
+        return_exceptions=True,
+    )
+    counts: dict[int, int] = {}
+    warnings: list[str] = []
+    for page, response in zip(pages, responses):
+        if isinstance(response, asyncio.CancelledError):
+            raise response
+        if isinstance(response, Exception):
+            warnings.append(f"{media_type} {section} page {page} unavailable")
+            continue
+        found, source_warnings = response
+        if source_warnings:
+            warnings.extend(source_warnings)
+            continue
+        titles = persist_titles(session, found)
+        values = {
+            "key": f"discover:{section}:{media_type}:{page}:{today.isoformat()}",
+            "title_ids_json": json.dumps([title.id for title in titles]),
+            "fetched_at": utc_now(), "result_count": len(titles),
+        }
+        session.execute(upsert_statement(
+            SearchSnapshot, values, ["key"],
+            {field: values[field] for field in ("title_ids_json", "fetched_at", "result_count")},
+        ))
+        counts[page] = len(titles)
+        if page == deeper_page:
+            cursor.next_page = page + 1 if len(found) >= 20 and page < 50 else 2
+            cursor.updated_at = utc_now()
+    if 1 in counts:
+        slot.next_page = (lane_index + 1) % len(REFRESH_LANES) + 1
+        slot.updated_at = utc_now()
+    session.execute(delete(ProviderRateWindow).where(ProviderRateWindow.second < int(time.time()) - 86400))
+    session.commit()
+    if 1 not in counts:
+        raise HTTPException(status_code=503, detail="Release refresh could not load the first page")
+    return {"media_type": media_type, "section": section, "pages": counts,
+            "next_page": cursor.next_page, "warnings": warnings}
 
 
 def find_user(session: Session, clerk_user_id: str, *, create: bool) -> CatalogUser | None:
