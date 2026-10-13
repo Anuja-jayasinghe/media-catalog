@@ -11,7 +11,7 @@ import httpx
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, event, inspect, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
@@ -67,6 +67,32 @@ def test_unified_search_creates_shared_titles_and_reuses_snapshot(client, monkey
     assert calls == 1
     with sessions() as session:
         assert len(session.scalars(select(Title)).all()) == 3
+
+
+def test_catalog_page_persistence_uses_bounded_database_reads(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'batch.sqlite3'}")
+    Base.metadata.create_all(engine)
+    titles = [ProviderTitle("igdb", "game", str(index), f"Game {index}", "", None, None)
+              for index in range(20)]
+    reads = 0
+
+    def count_reads(_connection, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal reads
+        if statement.lstrip().upper().startswith("SELECT"):
+            reads += 1
+
+    event.listen(engine, "before_cursor_execute", count_reads)
+    with sessionmaker(bind=engine)() as session:
+        main.persist_titles(session, titles)
+        session.commit()
+    assert reads <= 6
+
+    reads = 0
+    with sessionmaker(bind=engine)() as session:
+        main.persist_titles(session, titles)
+        session.commit()
+    assert reads <= 8
+    engine.dispose()
 
 
 def test_discover_reuses_snapshot_and_adds_releases_to_shared_catalog(client, monkeypatch):
