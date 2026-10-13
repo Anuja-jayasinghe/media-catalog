@@ -334,38 +334,47 @@ def upsert_statement(model, values: dict, constraint_columns: list[str], updates
 
 
 def persist_titles(session: Session, found: list[ProviderTitle]) -> list[Title]:
+    if not found:
+        return []
+
+    source_keys = {(item.provider, item.media_type, item.provider_id) for item in found}
+    identity_keys = source_keys | {
+        (namespace, item.media_type, external_id)
+        for item in found for namespace, external_id in item.external_ids
+    }
+    identities = session.scalars(select(TitleIdentity).where(
+        tuple_(TitleIdentity.namespace, TitleIdentity.media_type, TitleIdentity.external_id).in_(identity_keys),
+    )).all()
+    title_ids = {identity.title_id for identity in identities}
+    existing = {title.id: title for title in session.scalars(select(Title).where(Title.id.in_(title_ids))).all()} if title_ids else {}
+    direct = session.scalars(select(Title).where(
+        tuple_(Title.provider, Title.media_type, Title.provider_id).in_(source_keys),
+    )).all()
+    existing.update({title.id: title for title in direct})
+    by_identity = {
+        (identity.namespace, identity.media_type, identity.external_id): existing[identity.title_id]
+        for identity in identities if identity.title_id in existing
+    }
+    by_source = {(title.provider, title.media_type, title.provider_id): title for title in direct}
+    alias_keys = set(session.execute(select(TitleAlias.title_id, TitleAlias.normalized).where(
+        TitleAlias.title_id.in_(existing),
+    )).all()) if existing else set()
+
     ordered: list[Title] = []
     seen: set[str] = set()
     for item in found:
-        identity = session.scalar(select(TitleIdentity).where(
-            TitleIdentity.namespace == item.provider,
-            TitleIdentity.media_type == item.media_type,
-            TitleIdentity.external_id == item.provider_id,
-        ))
-        title = session.get(Title, identity.title_id) if identity else None
+        keys = [(item.provider, item.media_type, item.provider_id), *(
+            (namespace, item.media_type, external_id) for namespace, external_id in item.external_ids
+        )]
+        title = next((by_identity[key] for key in keys if key in by_identity), None)
         if title is None:
-            for namespace, external_id in item.external_ids:
-                identity = session.scalar(select(TitleIdentity).where(
-                    TitleIdentity.namespace == namespace,
-                    TitleIdentity.media_type == item.media_type,
-                    TitleIdentity.external_id == external_id,
-                ))
-                if identity:
-                    title = session.get(Title, identity.title_id)
-                    break
-        if title is None:
-            title = session.scalar(select(Title).where(
-                Title.provider == item.provider,
-                Title.media_type == item.media_type,
-                Title.provider_id == item.provider_id,
-            ))
+            title = by_source.get(keys[0])
         if title is None:
             title = Title(id=uuid.uuid4().hex, provider=item.provider, media_type=item.media_type,
                           provider_id=item.provider_id, name=item.name,
                           overview=item.overview, poster_url=item.poster_url,
-                          release_date=item.release_date)
+                          release_date=item.release_date, verified=True)
             session.add(title)
-            session.flush()
             previous_name = item.name
         else:
             previous_name = title.name if title.verified else item.name
@@ -382,35 +391,33 @@ def persist_titles(session: Session, found: list[ProviderTitle]) -> list[Title]:
                 title.release_date = item.release_date or title.release_date
                 title.updated_at = utc_now()
             title.verified = True
-        for namespace, external_id in ((item.provider, item.provider_id), *item.external_ids):
-            linked = session.scalar(select(TitleIdentity).where(
-                TitleIdentity.namespace == namespace,
-                TitleIdentity.media_type == item.media_type,
-                TitleIdentity.external_id == external_id,
-            ))
-            if linked is None:
+        by_source[(title.provider, title.media_type, title.provider_id)] = title
+        for namespace, media_type, external_id in keys:
+            key = (namespace, media_type, external_id)
+            if key not in by_identity:
                 session.add(TitleIdentity(title_id=title.id, namespace=namespace,
-                                          media_type=item.media_type, external_id=external_id))
+                                          media_type=media_type, external_id=external_id))
+                by_identity[key] = title
         for value in (previous_name, title.name, item.name, *item.aliases):
             key = normalize_name(value)
-            if key and session.scalar(select(TitleAlias.id).where(
-                TitleAlias.title_id == title.id, TitleAlias.normalized == key,
-            )) is None:
+            if key and (title.id, key) not in alias_keys:
                 session.add(TitleAlias(title_id=title.id, value=value,
                                        normalized=key, source=item.provider))
-        session.flush()
+                alias_keys.add((title.id, key))
         if title.id not in seen:
             ordered.append(title)
             seen.add(title.id)
+    session.flush()
     resolve_known_reports(session, ordered)
     return ordered
 
 
 def resolve_known_reports(session: Session, titles: list[Title]) -> None:
-    keys = set()
-    for title in titles:
-        for alias in session.scalars(select(TitleAlias).where(TitleAlias.title_id == title.id)):
-            keys.add((title.media_type, alias.normalized))
+    if not titles:
+        return
+    keys = set(session.execute(select(Title.media_type, TitleAlias.normalized).join(
+        TitleAlias, TitleAlias.title_id == Title.id,
+    ).where(Title.id.in_([title.id for title in titles]))).all())
     if not keys:
         return
     reports = session.scalars(select(MissingTitleReport).where(
