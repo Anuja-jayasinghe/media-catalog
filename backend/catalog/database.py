@@ -90,6 +90,26 @@ class SearchSnapshot(Base):
     result_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class ProviderRateWindow(Base):
+    """Shared admission counter for all API instances using one provider key."""
+
+    __tablename__ = "provider_rate_windows"
+
+    provider: Mapped[str] = mapped_column(String(16), primary_key=True)
+    second: Mapped[int] = mapped_column(Integer, primary_key=True)
+    used: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class CatalogRefreshCursor(Base):
+    """Persist the next browse page for each refresh lane."""
+
+    __tablename__ = "catalog_refresh_cursors"
+
+    key: Mapped[str] = mapped_column(String(32), primary_key=True)
+    next_page: Mapped[int] = mapped_column(Integer, default=2)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class TitleIdentity(Base):
     """An exact provider or external ID attached to a canonical title."""
 
