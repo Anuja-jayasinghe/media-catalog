@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import date
 from types import SimpleNamespace
 
@@ -185,6 +186,26 @@ def test_refresh_retries_lane_after_first_page_fails(client, monkeypatch):
         assert session.get(CatalogRefreshCursor, "slot").next_page == 1
 
 
+def test_refresh_accepts_explicit_lane_without_advancing_rotation(client, monkeypatch):
+    http, sessions = client
+    monkeypatch.setenv("CATALOG_JOB_TOKEN", "test-job-token")
+    calls = []
+
+    async def fake_browse(section, media_type, _today, page):
+        calls.append((section, media_type, page))
+        return ([], [])
+
+    monkeypatch.setattr(main, "browse_providers", fake_browse)
+    headers = {"Authorization": "Bearer test-job-token"}
+    assert http.post("/api/internal/refresh?media_type=game", headers=headers).status_code == 422
+    response = http.post("/api/internal/refresh?media_type=game&section=upcoming", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["media_type"] == "game"
+    assert calls == [("upcoming", "game", 1), ("upcoming", "game", 2)]
+    with sessions() as session:
+        assert session.get(CatalogRefreshCursor, "slot") is None
+
+
 def test_title_media_returns_trailer_and_external_link(client, monkeypatch):
     http, sessions = client
     with sessions() as session:
@@ -367,6 +388,11 @@ def test_newly_published_title_appears_during_search_snapshot(client, monkeypatc
 
 def test_missing_report_is_deduped_and_email_stays_private(client, monkeypatch):
     http, sessions = client
+    browse_calls = []
+
+    async def empty_browse(section, media_type, _today, page):
+        browse_calls.append((section, media_type, page))
+        return [], []
 
     async def empty_search(*_):
         return [], []
@@ -376,15 +402,79 @@ def test_missing_report_is_deduped_and_email_stays_private(client, monkeypatch):
         return 17, "https://github.com/example/catalog/issues/17"
 
     monkeypatch.setattr(main, "search_providers", empty_search)
+    monkeypatch.setattr(main, "browse_providers", empty_browse)
     monkeypatch.setattr(main, "create_github_issue", fake_issue)
     one = http.post("/api/missing-titles", json={"name": "Lost Film", "media_type": "movie", "email": "a@example.com"})
     two = http.post("/api/missing-titles", json={"name": "lost-film", "media_type": "movie", "email": "b@example.com"})
     assert one.status_code == two.status_code == 200
     assert one.json()["report_id"] == two.json()["report_id"]
     assert "email" not in str(one.json())
+    assert browse_calls == [("recent", "movie", 1), ("upcoming", "movie", 1)]
     with sessions() as session:
         assert len(session.scalars(select(MissingTitleReport)).all()) == 1
         assert {item.email for item in session.scalars(select(ReportSubscriber))} == {"a@example.com", "b@example.com"}
+
+
+def test_missing_title_refresh_finds_release_before_other_methods(client, monkeypatch):
+    http, sessions = client
+    calls = []
+
+    async def fake_browse(section, media_type, _today, page):
+        calls.append(("browse", section, media_type, page))
+        if section == "recent":
+            return [ProviderTitle("tmdb", "movie", "91", "New Film", "", None, date(2026, 10, 1))], []
+        return [], []
+
+    async def unexpected_search(*_):
+        raise AssertionError("provider search should not run after freshness finds the title")
+
+    monkeypatch.setattr(main, "browse_providers", fake_browse)
+    monkeypatch.setattr(main, "search_providers", unexpected_search)
+    response = http.post("/api/missing-titles", json={"name": "New Film", "media_type": "movie"})
+    assert response.status_code == 200
+    assert response.json()["status"] == "found"
+    assert calls == [("browse", "recent", "movie", 1), ("browse", "upcoming", "movie", 1)]
+    with sessions() as session:
+        assert len(session.scalars(select(Title)).all()) == 1
+        assert session.scalars(select(MissingTitleReport)).all() == []
+
+
+def test_missing_title_search_runs_after_empty_release_refresh(client, monkeypatch):
+    http, _ = client
+    calls = []
+
+    async def empty_browse(section, _media_type, _today, _page):
+        calls.append(section)
+        return [], []
+
+    async def found_search(*_):
+        calls.append("search")
+        return [ProviderTitle("igdb", "game", "77", "Lost Game", "", None, None)], []
+
+    monkeypatch.setattr(main, "browse_providers", empty_browse)
+    monkeypatch.setattr(main, "search_providers", found_search)
+    response = http.post("/api/missing-titles", json={"name": "Lost Game", "media_type": "game"})
+    assert response.json()["status"] == "found"
+    assert calls == ["recent", "upcoming", "search"]
+
+
+def test_missing_title_search_still_runs_when_refresh_is_unavailable(client, monkeypatch):
+    http, _ = client
+    calls = []
+
+    async def unavailable_browse(section, *_):
+        calls.append(section)
+        raise providers.ProviderSearchError("release feed unavailable")
+
+    async def found_search(*_):
+        calls.append("search")
+        return [ProviderTitle("tmdb", "tv", "83", "Lost Show", "", None, None)], []
+
+    monkeypatch.setattr(main, "browse_providers", unavailable_browse)
+    monkeypatch.setattr(main, "search_providers", found_search)
+    response = http.post("/api/missing-titles", json={"name": "Lost Show", "media_type": "tv"})
+    assert response.json()["status"] == "found"
+    assert calls == ["recent", "upcoming", "search"]
 
 
 def test_ambiguous_name_offers_choices_before_reporting(client, monkeypatch):
@@ -396,7 +486,11 @@ def test_ambiguous_name_offers_choices_before_reporting(client, monkeypatch):
             ProviderTitle("igdb", "game", "11", "Hades", "", None, date(2020, 9, 17)),
         ], []
 
+    async def empty_browse(*_):
+        return [], []
+
     monkeypatch.setattr(main, "search_providers", two_titles)
+    monkeypatch.setattr(main, "browse_providers", empty_browse)
     result = http.post("/api/missing-titles", json={"name": "Hades", "media_type": "game"})
     assert result.status_code == 200
     assert result.json()["status"] == "choices"
@@ -405,6 +499,39 @@ def test_ambiguous_name_offers_choices_before_reporting(client, monkeypatch):
         assert session.scalars(select(MissingTitleReport)).all() == []
     forced = http.post("/api/missing-titles", json={"name": "Hades", "media_type": "game", "force_report": True})
     assert forced.json()["status"] == "reported"
+    with sessions() as session:
+        report = session.scalar(select(MissingTitleReport))
+        assert len(json.loads(report.excluded_title_ids_json)) == 2
+
+
+def test_rejected_match_does_not_resolve_missing_report(client, monkeypatch):
+    http, sessions = client
+    with sessions() as session:
+        main.persist_titles(session, [ProviderTitle("tmdb", "movie", "1", "The Return", "", None, None)])
+        session.commit()
+
+    async def empty_browse(*_):
+        return [], []
+
+    async def old_match(*_):
+        return [ProviderTitle("tmdb", "movie", "1", "The Return", "", None, None)], []
+
+    monkeypatch.setattr(main, "browse_providers", empty_browse)
+    monkeypatch.setattr(main, "search_providers", old_match)
+    response = http.post("/api/missing-titles", json={"name": "The Return", "media_type": "movie", "force_report": True})
+    assert response.json()["status"] == "reported"
+    monkeypatch.setenv("CATALOG_JOB_TOKEN", "test-job-token")
+    result = http.post("/api/internal/reconcile", headers={"Authorization": "Bearer test-job-token"})
+    assert result.json()["resolved"] == 0
+    with sessions() as session:
+        assert session.scalar(select(MissingTitleReport)).status == "open"
+
+    with sessions() as session:
+        main.persist_titles(session, [ProviderTitle("tmdb", "movie", "2", "The Return", "", None, None)])
+        session.commit()
+        report = session.scalar(select(MissingTitleReport))
+        assert report.status == "resolved"
+        assert report.resolved_title_id != next(iter(json.loads(report.excluded_title_ids_json)))
 
 
 def test_reconcile_notifies_once_after_public_title_exists(client, monkeypatch):
@@ -412,6 +539,9 @@ def test_reconcile_notifies_once_after_public_title_exists(client, monkeypatch):
     sent = []
 
     async def empty_search(*_):
+        return [], []
+
+    async def empty_browse(*_):
         return [], []
 
     async def found_search(*_):
@@ -422,6 +552,7 @@ def test_reconcile_notifies_once_after_public_title_exists(client, monkeypatch):
         return "delivery-1"
 
     monkeypatch.setattr(main, "search_providers", empty_search)
+    monkeypatch.setattr(main, "browse_providers", empty_browse)
     monkeypatch.setattr(main, "send_publication_email", fake_email)
     response = http.post("/api/missing-titles", json={"name": "Hidden Film", "media_type": "movie", "email": "watcher@example.com"})
     assert response.json()["status"] == "reported"
@@ -501,6 +632,30 @@ def test_release_browse_orders_by_date_not_popularity(monkeypatch):
     assert b"sort first_release_date asc" in seen[3][1]["content"]
 
 
+def test_provider_call_waits_for_next_budget_window(monkeypatch):
+    reservations = 0
+    waits = []
+
+    def reserve(_provider):
+        nonlocal reservations
+        reservations += 1
+        if reservations == 1:
+            raise limits.ProviderRateLimited("budget exhausted")
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(providers, "reserve_provider_call", reserve)
+    monkeypatch.setattr(providers.asyncio, "sleep", fake_sleep)
+    async def request():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: httpx.Response(200))) as api:
+            return await providers.provider_request(api, "igdb", "GET", "https://example.test/")
+
+    assert asyncio.run(request()).status_code == 200
+    assert reservations == 2
+    assert len(waits) == 1
+
+
 def test_existing_report_table_gets_additive_columns(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'legacy.sqlite3'}")
     with engine.begin() as connection:
@@ -509,5 +664,5 @@ def test_existing_report_table_gets_additive_columns(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine, expire_on_commit=False))
     database.init_database()
     columns = {column["name"] for column in inspect(engine).get_columns("missing_title_reports")}
-    assert {"github_issue_closed_at", "admin_notified_at"} <= columns
+    assert {"github_issue_closed_at", "admin_notified_at", "excluded_title_ids_json"} <= columns
     engine.dispose()
