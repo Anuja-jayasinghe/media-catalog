@@ -18,7 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from catalog import main, database, limits
 from catalog import auth
 from catalog.auth import require_clerk_user
-from catalog.database import Base, CatalogRefreshCursor, CatalogUser, CustomList, EntryRevision, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SeasonProgress, ShareLink, Title, TitleAlias, TitleIdentity
+from catalog.database import Base, CatalogRefreshCursor, CatalogUser, CustomList, EntryRevision, ImportBatch, ImportChange, LibraryEntry, MissingTitleReport, ProviderRateWindow, ReportSubscriber, SearchSnapshot, SeasonProgress, ShareLink, Title, TitleAlias, TitleIdentity
 from catalog.providers import ProviderTitle
 from catalog import providers
 
@@ -422,6 +422,9 @@ def test_account_deletion_erases_private_catalog_after_clerk_succeeds(client, mo
         json={"status": "completed", "lists": ["Old games"]}).status_code == 200
     assert http.post("/api/shares", headers={"X-Test-User": "alice"}, json={"days": 1}).status_code == 201
     assert http.put(f"/api/library/{title_id}", headers={"X-Test-User": "bob"}, json={"status": "planned"}).status_code == 200
+    backup = http.get("/api/export/backup", headers={"X-Test-User": "alice"}).json()
+    backup["entries"][0]["rating_half_steps"] = 8
+    assert http.post("/api/imports/backup", headers={"X-Test-User": "alice"}, json=backup).status_code == 200
     deleted = []
     async def fake_delete(clerk_id):
         deleted.append(clerk_id)
@@ -434,6 +437,8 @@ def test_account_deletion_erases_private_catalog_after_clerk_succeeds(client, mo
         assert session.scalars(select(CustomList)).all() == []
         assert session.scalars(select(ShareLink)).all() == []
         assert len(session.scalars(select(EntryRevision)).all()) == 1
+        assert session.scalars(select(ImportBatch)).all() == []
+        assert session.scalars(select(ImportChange)).all() == []
 
 
 def test_native_backup_preserves_private_fields_and_csv_is_portable(client):
@@ -459,6 +464,108 @@ def test_native_backup_preserves_private_fields_and_csv_is_portable(client):
     assert rows[0]["title"] == "'=FORMULA"
     assert rows[0]["review"] == "'=HYPERLINK(\"bad\")"
     assert rows[0]["rating_5"] == "3.5"
+
+
+def test_native_backup_restores_fields_and_reverts_a_batch(client):
+    http, sessions = client
+    with sessions() as session:
+        title = Title(provider="tmdb", media_type="movie", provider_id="211", name="Restore this")
+        session.add(title)
+        session.commit()
+        title_id = title.id
+    alice = {"X-Test-User": "alice"}
+    bob = {"X-Test-User": "bob"}
+    assert http.put(f"/api/library/{title_id}", headers=alice, json={"status": "completed",
+        "completed_on": "2020-01-01", "date_precision": "month", "rating_half_steps": 8,
+        "review": "A note", "favorite": True, "lists": ["Classics"]}).status_code == 200
+    backup = http.get("/api/export/backup", headers=alice).json()
+    result = http.post("/api/imports/backup", headers=bob, json=backup)
+    assert result.status_code == 200, result.text
+    assert result.json()["created"] == 1
+    assert result.json()["provisional"] == 0
+    restored = http.get("/api/library", headers=bob).json()[0]
+    assert restored["review"] == "A note"
+    assert restored["lists"] == ["Classics"]
+    assert restored["completed_on"] == "2020-01-01"
+    batch_id = result.json()["batch_id"]
+    assert http.get("/api/imports", headers=bob).json()[0]["id"] == batch_id
+    reverted = http.post(f"/api/imports/{batch_id}/revert", headers=bob)
+    assert reverted.json()["skipped_changed_since_import"] == 0
+    assert http.get("/api/library", headers=bob).json() == []
+    assert http.get("/api/lists", headers=bob).json() == []
+    assert len(http.get("/api/library", headers=alice).json()) == 1
+
+
+def test_unverified_backup_title_is_private_to_library_until_provider_confirms(client, monkeypatch):
+    http, sessions = client
+    backup = {"format": "media-catalog-backup", "version": 1, "profile": {"display_name": "Collector"},
+        "lists": [], "entries": [{"title": {"id": "old-id", "provider": "tmdb", "provider_id": "99999",
+        "media_type": "movie", "name": "A restored film", "overview": "", "poster_url": None,
+        "release_date": None}, "status": "completed", "rating_half_steps": 7,
+        "review": "Still private", "favorite": False, "platforms": [], "lists": []}],
+        "season_progress": []}
+    imported = http.post("/api/imports/backup", json=backup)
+    assert imported.status_code == 200, imported.text
+    assert imported.json()["provisional"] == 1
+    entry = http.get("/api/library").json()[0]
+    assert entry["title"]["verified"] is False
+    title_id = entry["title"]["id"]
+    assert http.get(f"/api/titles/{title_id}").status_code == 404
+    with sessions() as session:
+        assert main.local_search(session, "A restored film", "movie") == []
+    with sessions() as session:
+        main.persist_titles(session, [ProviderTitle("tmdb", "movie", "99999", "A restored film", "Official", None, None)])
+        session.commit()
+    assert http.get(f"/api/titles/{title_id}").json()["verified"] is True
+    assert http.get("/api/library").json()[0]["review"] == "Still private"
+    with sessions() as session:
+        assert len(session.scalars(select(Title)).all()) == 1
+
+
+def test_import_revert_skips_items_changed_after_import(client):
+    http, sessions = client
+    with sessions() as session:
+        title = Title(provider="igdb", media_type="game", provider_id="502", name="Keep newer edit")
+        session.add(title)
+        session.commit()
+        title_id = title.id
+    backup = {"format": "media-catalog-backup", "version": 1,
+        "entries": [{"title": {"id": title_id, "provider": "igdb", "provider_id": "502",
+        "media_type": "game", "name": "Keep newer edit", "overview": "", "poster_url": None,
+        "release_date": None}, "status": "planned", "lists": []}]}
+    batch = http.post("/api/imports/backup", json=backup).json()["batch_id"]
+    assert http.put(f"/api/library/{title_id}", json={"status": "completed"}).status_code == 200
+    result = http.post(f"/api/imports/{batch}/revert")
+    assert result.json()["skipped_changed_since_import"] == 1
+    assert http.get("/api/library").json()[0]["status"] == "completed"
+
+
+def test_native_backup_restores_tv_cutoff_and_can_revert_one_change(client, monkeypatch):
+    http, sessions = client
+    with sessions() as session:
+        show = Title(provider="tmdb", media_type="tv", provider_id="603", name="Seasonal show")
+        session.add(show)
+        session.commit()
+        title_id = show.id
+    today = database.utc_now().date()
+    async def episodes(*_):
+        return [{"number": 1, "name": "Aired", "air_date": today - timedelta(days=2)},
+                {"number": 2, "name": "Future", "air_date": today + timedelta(days=2)}]
+    monkeypatch.setattr(main, "tv_episodes", episodes)
+    path = f"/api/library/{title_id}/seasons/1"
+    alice = {"X-Test-User": "alice"}
+    bob = {"X-Test-User": "bob"}
+    assert http.put(path, headers=alice, json={}).status_code == 200
+    backup = http.get("/api/export/backup", headers=alice).json()
+    imported = http.post("/api/imports/backup", headers=bob, json=backup).json()
+    assert imported.get("season_marks") == 1, imported
+    assert [item["watched"] for item in http.get(path, headers=bob).json()] == [True, False]
+    changes = http.get(f"/api/imports/{imported['batch_id']}/changes", headers=bob).json()
+    season_change = next(item for item in changes if item["kind"] == "season")
+    assert http.post(f"/api/imports/{imported['batch_id']}/changes/{season_change['id']}/revert",
+                     headers=bob).status_code == 200
+    assert [item["watched"] for item in http.get(path, headers=bob).json()] == [False, False]
+    assert len(http.get("/api/library", headers=bob).json()) == 1
 
 
 def test_unknown_title_cannot_be_saved(client):
