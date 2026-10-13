@@ -148,6 +148,7 @@ class MissingTitleReport(Base):
     normalized_name: Mapped[str] = mapped_column(String(500), index=True)
     status: Mapped[str] = mapped_column(String(16), default="open")
     resolved_title_id: Mapped[str | None] = mapped_column(ForeignKey("titles.id"))
+    excluded_title_ids_json: Mapped[str] = mapped_column(Text, default="[]")
     github_issue_number: Mapped[int | None] = mapped_column(Integer)
     github_issue_url: Mapped[str | None] = mapped_column(Text)
     github_issue_closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -171,13 +172,15 @@ class ReportSubscriber(Base):
 def init_database() -> None:
     Base.metadata.create_all(engine)
     # Older development databases already have this table. create_all does not
-    # add columns to existing tables, so apply the two additive report fields.
+    # add columns to existing tables, so apply additive report fields.
     with engine.begin() as connection:
         columns = {column["name"] for column in inspect(connection).get_columns("missing_title_reports")}
         timestamp_type = DateTime(timezone=True).compile(dialect=engine.dialect)
         for column in ("github_issue_closed_at", "admin_notified_at"):
             if column not in columns:
                 connection.execute(text(f"ALTER TABLE missing_title_reports ADD COLUMN {column} {timestamp_type}"))
+        if "excluded_title_ids_json" not in columns:
+            connection.execute(text("ALTER TABLE missing_title_reports ADD COLUMN excluded_title_ids_json TEXT DEFAULT '[]'"))
     # Existing local records predate the identity and alias tables.
     from .identity import normalize_name
 

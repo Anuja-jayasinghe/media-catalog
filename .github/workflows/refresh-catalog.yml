@@ -2,7 +2,8 @@ name: Refresh release catalog
 
 on:
   schedule:
-    - cron: "37 * * * *"
+    # GitHub cron has no every-other-week syntax; the step below skips alternate weeks.
+    - cron: "37 4 * * 0"
   workflow_dispatch:
 
 concurrency:
@@ -13,7 +14,23 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     steps:
-      - name: Refresh one release lane
+      - name: Check two-week cadence
+        id: cadence
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          anchor=$(date -u -d '2026-10-18 00:00:00 UTC' +%s)
+          weeks_since_anchor=$(( ($(date -u +%s) - anchor) / 604800 ))
+          if [ $((weeks_since_anchor % 2)) -eq 0 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping alternate week."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Refresh all release lanes
+        if: steps.cadence.outputs.run == 'true'
         env:
           CATALOG_API_URL: ${{ secrets.CATALOG_API_URL }}
           CATALOG_JOB_TOKEN: ${{ secrets.CATALOG_JOB_TOKEN }}
@@ -22,7 +39,15 @@ jobs:
             echo "Catalog refresh is not configured; skipping."
             exit 0
           fi
-          curl --fail --show-error --silent --retry 2 --max-time 55 \
-            --request POST \
-            --header "Authorization: Bearer $CATALOG_JOB_TOKEN" \
-            "$CATALOG_API_URL/api/internal/refresh"
+          failed=0
+          for media in movie tv game; do
+            for section in recent upcoming; do
+              if ! curl --fail --show-error --silent --retry 2 --max-time 55 \
+                --request POST \
+                --header "Authorization: Bearer $CATALOG_JOB_TOKEN" \
+                "$CATALOG_API_URL/api/internal/refresh?media_type=$media&section=$section"; then
+                failed=1
+              fi
+            done
+          done
+          exit "$failed"
